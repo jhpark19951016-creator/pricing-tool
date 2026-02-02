@@ -2,7 +2,7 @@ import os
 import datetime as dt
 import math
 from dataclasses import dataclass
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 
 import requests
 import pandas as pd
@@ -13,7 +13,6 @@ M2_PER_PYEONG = 3.305785
 
 
 def ym_backwards(end_ym: str, months: int) -> List[str]:
-    """Return YYYYMM list going backwards, inclusive of end_ym."""
     y = int(end_ym[:4])
     m = int(end_ym[4:6])
     out = []
@@ -52,10 +51,9 @@ def to_float(x: Any) -> float:
 
 
 def won_per_pyeong_from_trade(deal_amount_manwon: int, exclu_m2: float) -> float:
-    """deal_amount in 만원, exclu_m2 in ㎡ -> 원/평(전용 기준)"""
     if exclu_m2 <= 0:
         return 0.0
-    won = deal_amount_manwon * 10000  # 만원 -> 원
+    won = deal_amount_manwon * 10000
     won_per_m2 = won / exclu_m2
     return won_per_m2 * M2_PER_PYEONG
 
@@ -63,25 +61,71 @@ def won_per_pyeong_from_trade(deal_amount_manwon: int, exclu_m2: float) -> float
 def safe_list(x):
     if x is None:
         return []
-    if isinstance(x, list):
-        return x
-    return [x]
+    return x if isinstance(x, list) else [x]
 
 
 @dataclass
 class RtmsConfig:
     service_key: str
-    timeout_sec: int = 20
+    timeout_sec: int = 25
 
 
-def fetch_rtms_items(base_url: str, params: Dict[str, str], timeout: int = 20) -> List[Dict[str, Any]]:
-    r = requests.get(base_url, params=params, timeout=timeout)
-    r.raise_for_status()
-    obj = xmltodict.parse(r.text)
-    resp = obj.get("response", {})
-    body = resp.get("body", {})
-    items = body.get("items", {})
-    return safe_list(items.get("item"))
+def _mask_service_key(s: str) -> str:
+    if not s:
+        return ""
+    return s[:6] + "..." + s[-6:] if len(s) > 20 else "***"
+
+
+def parse_result_meta(xml_text: str) -> Tuple[str, str]:
+    try:
+        obj = xmltodict.parse(xml_text)
+        header = obj.get("response", {}).get("header", {})
+        return str(header.get("resultCode", "")), str(header.get("resultMsg", ""))
+    except Exception:
+        return "", ""
+
+
+def fetch_rtms_items(base_url: str, params: Dict[str, str], timeout: int = 25) -> List[Dict[str, Any]]:
+    """
+    Robust fetch:
+    - Never hard-crash the app on HTTP errors
+    - Show actionable debug info (status, resultCode/resultMsg) without leaking serviceKey
+    """
+    try:
+        r = requests.get(base_url, params=params, timeout=timeout)
+        if r.status_code != 200:
+            rc, rm = parse_result_meta(r.text)
+            st.error(
+                "실거래 API 호출이 실패했습니다. "
+                f"(HTTP {r.status_code})\n\n"
+                f"- resultCode: {rc or 'N/A'}\n"
+                f"- resultMsg: {rm or 'N/A'}\n\n"
+                "가능 원인: 서비스키(디코딩/인코딩) 문제, 호출 한도 초과, "
+                "파라미터 오류(LAWD_CD/DEAL_YMD), 또는 일시적 서버 오류입니다."
+            )
+            with st.expander("디버그(응답 일부 보기)"):
+                st.code((r.text or "")[:2000])
+            return []
+        obj = xmltodict.parse(r.text)
+        resp = obj.get("response", {})
+        header = resp.get("header", {})
+        body = resp.get("body", {})
+        result_code = str(header.get("resultCode", ""))
+        result_msg = str(header.get("resultMsg", ""))
+        if result_code and result_code != "00":
+            st.warning(f"API 응답 resultCode={result_code}, resultMsg={result_msg}")
+            return []
+        items = body.get("items", {})
+        return safe_list(items.get("item"))
+    except requests.exceptions.Timeout:
+        st.error("실거래 API 호출이 타임아웃되었습니다. (잠시 후 다시 시도해주세요)")
+        return []
+    except requests.exceptions.RequestException as e:
+        st.error(f"실거래 API 호출 중 네트워크 오류가 발생했습니다: {e}")
+        return []
+    except Exception as e:
+        st.error(f"실거래 API 응답 파싱 중 오류가 발생했습니다: {e}")
+        return []
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -202,6 +246,12 @@ st.title("분양가 산정 Tool (일반 사업성 + 상한제 + 실거래 자동
 st.caption("회사 PC에서도 URL로 사용. 주변시세는 국토부 실거래가 OpenAPI를 자동 조회합니다.")
 
 service_key = st.secrets.get("SERVICE_KEY", "").strip()
+
+with st.sidebar:
+    st.subheader("설정")
+    st.caption("서비스키는 Secrets에서 읽습니다. (표시는 마스킹)")
+    st.code(_mask_service_key(service_key))
+
 if not service_key:
     st.warning("SERVICE_KEY가 설정되지 않았습니다. (Streamlit Cloud → App settings → Secrets에 넣어주세요)")
 
@@ -210,7 +260,6 @@ lawd_df = load_lawd_codes()
 
 with st.sidebar:
     st.subheader("주변 시세 자동 (실거래)")
-
     q = st.text_input("지역 검색(선택)", value="", key="sidebar_search")
     view = lawd_df
     if q.strip():
@@ -265,7 +314,6 @@ with col2:
     c_etc = st.number_input("간접비/기타(선택, 원)", value=0.0, step=1_000_000.0, format="%.0f", key="c_etc")
     c_vat = st.number_input("상한제 부가세율(%, 선택)", min_value=0.0, max_value=20.0, value=0.0, step=1.0, key="c_vat")
 
-# Supply-based calculations
 g_cost = g_land + g_const + g_add + g_design + g_fin + g_mkt + g_oh + g_etc
 g_profit = g_cost * (g_margin / 100.0)
 g_supply_price = g_cost + g_profit
@@ -313,9 +361,7 @@ if run:
             market_count = len(filtered)
             if market_count > 0:
                 market_avg_exclu = float(filtered["평당가(원/평,전용)"].mean())
-                # 공급기준 시세기반 분양가(공급) = 전용기준 × 전용률 × α × β
                 market_price_supply = market_avg_exclu * float(exclusive_ratio) * float(alpha) * float(beta)
-
                 st.success(
                     f"집계 {market_count}건 · "
                     f"평당 평균(전용) {fmt0(market_avg_exclu)}원/평 · "
