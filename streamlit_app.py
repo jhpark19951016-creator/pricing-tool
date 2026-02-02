@@ -194,6 +194,9 @@ def fmt0(x: float) -> str:
         return "-"
 
 
+# -----------------------------
+# UI
+# -----------------------------
 st.set_page_config(page_title="분양가 산정 Tool", layout="wide")
 st.title("분양가 산정 Tool (일반 사업성 + 상한제 + 실거래 자동)")
 st.caption("회사 PC에서도 URL로 사용. 주변시세는 국토부 실거래가 OpenAPI를 자동 조회합니다.")
@@ -207,7 +210,8 @@ lawd_df = load_lawd_codes()
 
 with st.sidebar:
     st.subheader("주변 시세 자동 (실거래)")
-    q = st.text_input("지역 검색(선택)", value="")
+
+    q = st.text_input("지역 검색(선택)", value="", key="sidebar_search")
     view = lawd_df
     if q.strip():
         qq = q.strip().lower()
@@ -216,51 +220,52 @@ with st.sidebar:
             st.info("검색 결과가 없습니다. lawd_codes.csv에 지역을 추가하세요.")
             view = lawd_df
 
-    sel = st.selectbox("법정동코드(시군구 5자리) 선택", view["label"].tolist(), index=0)
+    sel = st.selectbox("법정동코드(시군구 5자리) 선택", view["label"].tolist(), index=0, key="sidebar_lawd_select")
     lawd_cd = view[view["label"] == sel]["code"].iloc[0]
 
-    end_ym = st.text_input("기준 계약년월(YYYYMM)", value=dt.date.today().strftime("%Y%m"))
-    months = st.number_input("최근 기간(개월)", min_value=1, max_value=36, value=12, step=1)
-    assets = st.multiselect("조회 대상", ["아파트", "오피스텔"], default=["아파트", "오피스텔"])
+    end_ym = st.text_input("기준 계약년월(YYYYMM)", value=dt.date.today().strftime("%Y%m"), key="sidebar_endym")
+    months = st.number_input("최근 기간(개월)", min_value=1, max_value=36, value=12, step=1, key="sidebar_months")
+    assets = st.multiselect("조회 대상", ["아파트", "오피스텔"], default=["아파트", "오피스텔"], key="sidebar_assets")
 
     st.divider()
     st.subheader("호갱노노식 집계")
-    target_m2 = st.number_input("기준 전용면적(㎡)", min_value=10.0, max_value=300.0, value=84.0, step=1.0)
-    tol_m2 = st.number_input("허용오차(±㎡)", min_value=0.0, max_value=20.0, value=3.0, step=0.5)
-    keyword = st.text_input("단지명 키워드(선택)", value="")
-    recent_n = st.number_input("최근 N건 (0=미사용)", min_value=0, max_value=200, value=30, step=5)
+    target_m2 = st.number_input("기준 전용면적(㎡)", min_value=10.0, max_value=300.0, value=84.0, step=1.0, key="sidebar_target_m2")
+    tol_m2 = st.number_input("허용오차(±㎡)", min_value=0.0, max_value=20.0, value=3.0, step=0.5, key="sidebar_tol_m2")
+    keyword = st.text_input("단지명 키워드(선택)", value="", key="sidebar_keyword")
+    recent_n = st.number_input("최근 N건 (0=미사용)", min_value=0, max_value=200, value=30, step=5, key="sidebar_recent_n")
 
     st.divider()
     st.subheader("시세 → 분양가(공급기준)")
-    exclusive_ratio = st.number_input("전용률(전용/공급) 예: 0.70", min_value=0.50, max_value=0.95, value=0.70, step=0.01)
-    alpha = st.number_input("시세 반영계수 α", min_value=0.50, max_value=1.50, value=0.98, step=0.01)
-    beta = st.number_input("상품 프리미엄/디스카운트 β", min_value=0.70, max_value=1.30, value=1.00, step=0.01)
+    exclusive_ratio = st.number_input("전용률(전용/공급) 예: 0.70", min_value=0.50, max_value=0.95, value=0.70, step=0.01, key="sidebar_excl_ratio")
+    alpha = st.number_input("시세 반영계수 α", min_value=0.50, max_value=1.50, value=0.98, step=0.01, key="sidebar_alpha")
+    beta = st.number_input("상품 프리미엄/디스카운트 β", min_value=0.70, max_value=1.30, value=1.00, step=0.01, key="sidebar_beta")
 
 col1, col2 = st.columns(2)
 
 with col1:
     st.subheader("1) 일반 사업성(원가+이윤) — 공급기준")
-    g_supply_m2 = st.number_input("공급면적 합계(㎡)", value=45000.0, step=100.0)
-    g_land = st.number_input("택지비(총, 원)", value=350_000_000_000.0, step=1_000_000.0, format="%.0f")
-    g_const = st.number_input("건축비(총, 원)", value=176_000_000_000.0, step=1_000_000.0, format="%.0f")
-    g_add = st.number_input("가산비(총, 원)", value=20_000_000_000.0, step=1_000_000.0, format="%.0f")
-    g_design = st.number_input("설계·감리비(총, 원)", value=5_000_000_000.0, step=1_000_000.0, format="%.0f")
-    g_fin = st.number_input("금융비용(총, 원)", value=12_000_000_000.0, step=1_000_000.0, format="%.0f")
-    g_mkt = st.number_input("분양·홍보비(총, 원)", value=4_000_000_000.0, step=1_000_000.0, format="%.0f")
-    g_oh = st.number_input("일반관리비(총, 원)", value=6_000_000_000.0, step=1_000_000.0, format="%.0f")
-    g_etc = st.number_input("기타(총, 원)", value=3_000_000_000.0, step=1_000_000.0, format="%.0f")
-    g_margin = st.number_input("이윤율(%)", min_value=0.0, max_value=30.0, value=8.0, step=0.5)
-    g_vat = st.number_input("부가세율(%)", min_value=0.0, max_value=20.0, value=10.0, step=1.0)
+    g_supply_m2 = st.number_input("공급면적 합계(㎡)", value=45000.0, step=100.0, key="g_supply_m2")
+    g_land = st.number_input("택지비(총, 원)", value=350_000_000_000.0, step=1_000_000.0, format="%.0f", key="g_land")
+    g_const = st.number_input("건축비(총, 원)", value=176_000_000_000.0, step=1_000_000.0, format="%.0f", key="g_const")
+    g_add = st.number_input("가산비(총, 원)", value=20_000_000_000.0, step=1_000_000.0, format="%.0f", key="g_add")
+    g_design = st.number_input("설계·감리비(총, 원)", value=5_000_000_000.0, step=1_000_000.0, format="%.0f", key="g_design")
+    g_fin = st.number_input("금융비용(총, 원)", value=12_000_000_000.0, step=1_000_000.0, format="%.0f", key="g_fin")
+    g_mkt = st.number_input("분양·홍보비(총, 원)", value=4_000_000_000.0, step=1_000_000.0, format="%.0f", key="g_mkt")
+    g_oh = st.number_input("일반관리비(총, 원)", value=6_000_000_000.0, step=1_000_000.0, format="%.0f", key="g_oh")
+    g_etc = st.number_input("기타(총, 원)", value=3_000_000_000.0, step=1_000_000.0, format="%.0f", key="g_etc")
+    g_margin = st.number_input("이윤율(%)", min_value=0.0, max_value=30.0, value=8.0, step=0.5, key="g_margin")
+    g_vat = st.number_input("부가세율(%)", min_value=0.0, max_value=20.0, value=10.0, step=1.0, key="g_vat")
 
 with col2:
     st.subheader("2) 분양가상한제(간이) — 공급기준")
-    c_supply_m2 = st.number_input("상한제 기준 공급면적 합계(㎡)", value=45000.0, step=100.0)
-    c_land = st.number_input("택지비(총, 원)", value=350_000_000_000.0, step=1_000_000.0, format="%.0f")
-    c_basic = st.number_input("기본형 건축비(총, 원)", value=176_000_000_000.0, step=1_000_000.0, format="%.0f")
-    c_add = st.number_input("가산비(총, 원)", value=20_000_000_000.0, step=1_000_000.0, format="%.0f")
-    c_etc = st.number_input("간접비/기타(선택, 원)", value=0.0, step=1_000_000.0, format="%.0f")
-    c_vat = st.number_input("상한제 부가세율(%, 선택)", min_value=0.0, max_value=20.0, value=0.0, step=1.0)
+    c_supply_m2 = st.number_input("상한제 기준 공급면적 합계(㎡)", value=45000.0, step=100.0, key="c_supply_m2")
+    c_land = st.number_input("택지비(총, 원)", value=350_000_000_000.0, step=1_000_000.0, format="%.0f", key="c_land")
+    c_basic = st.number_input("기본형 건축비(총, 원)", value=176_000_000_000.0, step=1_000_000.0, format="%.0f", key="c_basic")
+    c_add = st.number_input("가산비(총, 원)", value=20_000_000_000.0, step=1_000_000.0, format="%.0f", key="c_add")
+    c_etc = st.number_input("간접비/기타(선택, 원)", value=0.0, step=1_000_000.0, format="%.0f", key="c_etc")
+    c_vat = st.number_input("상한제 부가세율(%, 선택)", min_value=0.0, max_value=20.0, value=0.0, step=1.0, key="c_vat")
 
+# Supply-based calculations
 g_cost = g_land + g_const + g_add + g_design + g_fin + g_mkt + g_oh + g_etc
 g_profit = g_cost * (g_margin / 100.0)
 g_supply_price = g_cost + g_profit
@@ -276,7 +281,7 @@ c_won_per_py_supply = (c_total / c_supply_m2) * M2_PER_PYEONG if c_supply_m2 > 0
 st.divider()
 st.subheader("3) 주변 시세 자동(실거래가) — 아파트 + 오피스텔")
 
-run = st.button("실거래가 자동 조회 / 재계산", type="primary")
+run = st.button("실거래가 자동 조회 / 재계산", type="primary", key="run_btn")
 
 market_avg_exclu = 0.0
 market_price_supply = 0.0
