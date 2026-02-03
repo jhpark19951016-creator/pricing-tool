@@ -8,7 +8,6 @@ from typing import Dict, Any, List, Tuple, Optional
 import requests
 import pandas as pd
 import streamlit as st
-import re
 import xmltodict
 
 import matplotlib.pyplot as plt
@@ -366,13 +365,16 @@ def reverse_geocode(lat: float, lon: float) -> Optional[Dict[str, Any]]:
         return None
 
 
+
 def infer_lawd_from_latlon(lawd_df: pd.DataFrame, lat: float, lon: float) -> Tuple[Optional[str], str]:
     """Return (LAWD_CD, label) inferred from a latitude/longitude.
 
-    Uses Nominatim reverse-geocode (best-effort) and matches against our LAWD list.
+    핵심 포인트:
+      - '중구/서구/동구'처럼 중복 구명이 많으므로 '광역(시/도) + 시군구' 동시 매칭을 **최우선**으로 합니다.
+      - 시군구 단독(dist_ko) 매칭은 **유일할 때만** 채택합니다(중복이면 사용자 선택 필요).
     """
     if lawd_df is None or lawd_df.empty:
-        return None, "LAWD 목록이 비어있습니다"
+        return None, "LAWD 목록이 비어있습니다(법정동코드 로딩 실패)"
 
     data = reverse_geocode(lat, lon)
     if not data:
@@ -381,29 +383,43 @@ def infer_lawd_from_latlon(lawd_df: pd.DataFrame, lat: float, lon: float) -> Tup
     addr = data.get("address", {}) or {}
     metro_ko, dist_ko = _guess_korean_admin(addr)
 
-    # candidates like '서울특별시 강서구' etc.
-    candidates: List[str] = []
+    labels = lawd_df["label"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
+
+    # 1) 광역+시군구 정확/포함 매칭 (가장 정확)
     if metro_ko and dist_ko:
-        candidates.append(f"{metro_ko} {dist_ko}")
+        metro_variants = [metro_ko]
+        # '서울특별시' → '서울' 같은 축약도 허용
+        if metro_ko.endswith("특별시"):
+            metro_variants.append(metro_ko.replace("특별시", ""))
+        if metro_ko.endswith("광역시"):
+            metro_variants.append(metro_ko.replace("광역시", ""))
+        if metro_ko.endswith("특별자치시"):
+            metro_variants.append(metro_ko.replace("특별자치시", ""))
+        if metro_ko.endswith("특별자치도"):
+            metro_variants.append(metro_ko.replace("특별자치도", ""))
+
+        for mv in metro_variants:
+            # label은 '서울특별시 중구' 형태가 일반적이라 둘 다 포함이면 OK
+            hit = lawd_df[
+                labels.str.contains(re.escape(mv), na=False)
+                & labels.str.contains(re.escape(dist_ko), na=False)
+            ]
+            if not hit.empty:
+                row = hit.iloc[0]
+                return str(row["code"]), str(row["label"])
+
+    # 2) 시군구 단독(dist_ko) 매칭은 유일할 때만
     if dist_ko:
-        candidates.append(dist_ko)
-
-    labels = lawd_df["label"].astype(str)
-
-    for c in candidates:
-        hit = lawd_df[lawd_df["label"].str.contains(re.escape(c), na=False)]
-        if not hit.empty:
+        hit = lawd_df[labels.str.fullmatch(re.escape(dist_ko)) | labels.str.endswith(" " + dist_ko)]
+        if len(hit) == 1:
             row = hit.iloc[0]
             return str(row["code"]), str(row["label"])
-
-    disp = str(data.get("display_name", ""))
-    # fallback: look for any label substring inside display_name
-    for _, row in lawd_df.iterrows():
-        lab = str(row.get("label", ""))
-        if lab and lab in disp:
-            return str(row["code"]), str(row["label"])
+        if len(hit) > 1:
+            # 중복 구명 → 자동선택 금지
+            return None, f"시군구명이 중복됩니다: '{dist_ko}' (예: 서울/대구 중구). 드롭다운에서 직접 선택해주세요."
 
     return None, f"시군구 자동 추정 실패: {metro_ko} {dist_ko}".strip()
+
 
 def static_map_url(lat: float, lon: float, zoom: int = 13, w: int = 1100, h: int = 620, markers: Optional[List[Tuple[float,float,str]]] = None) -> str:
     base = "https://staticmap.openstreetmap.de/staticmap.php"
@@ -603,7 +619,40 @@ st.title("분양가 산정 Tool — 보고서 자동 생성 (시세·입지·브
 st.caption("대상지 위치/조건 입력 → 실거래 자동 조회 → ‘보고서(PDF)’ 형식으로 결과를 출력합니다.")
 
 service_key = st.secrets.get("SERVICE_KEY", "").strip()
+
 cfg = RtmsConfig(service_key=service_key)
+
+# --- 법정동코드(전국/리단위) 로딩 ---
+lawd_full = load_lawd_full_codes()
+if lawd_full is None or lawd_full.empty:
+    # 네트워크 차단/다운로드 실패 시: 사용자 업로드로 대체
+    with st.sidebar:
+        st.warning("전국 법정동코드 자동 다운로드에 실패했습니다. (사내망 차단 등)\n"
+                   "아래에서 'jscode*.zip' 또는 'KiKcd_B.*' 텍스트 파일을 업로드하면 계속 진행할 수 있습니다.")
+        up = st.file_uploader("법정동코드 파일 업로드(zip/txt)", type=["zip", "txt"])
+        if up is not None:
+            try:
+                raw = up.getvalue()
+                if up.name.lower().endswith(".zip"):
+                    lawd_full = _parse_kikcd_b_from_zip(raw)
+                else:
+                    # txt 단독 업로드: zip과 동일 로직으로 파싱
+                    text = _read_text_with_fallback(raw)
+                    sep = _sniff_delimiter(text.splitlines()[0] if text else "")
+                    lawd_full = pd.read_csv(io.StringIO(text), sep=sep, dtype=str, engine="python")
+                    # 최소 스키마로 정규화
+                    lawd_full = pd.DataFrame({
+                        "code10": lawd_full.iloc[:, 0].astype(str).str.replace(r"\D", "", regex=True).str.zfill(10),
+                        "full_name": lawd_full.iloc[:, 1].astype(str) if lawd_full.shape[1] > 1 else "",
+                    })
+                    lawd_full["lawd5"] = lawd_full["code10"].str[:5]
+                _ensure_cache_dir()
+                lawd_full.to_parquet(LAWDFULL_CACHE_PARQUET, index=False)
+                st.success("법정동코드 업로드/캐시 완료! 새로고침(F5) 후 다시 시도해보세요.")
+            except Exception as e:
+                st.error(f"업로드 파싱 실패: {e}")
+
+# 시군구 5자리 목록(드롭다운)에 사용
 lawd_df = load_lawd_codes()
 
 with st.sidebar:
