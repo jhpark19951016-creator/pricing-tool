@@ -392,13 +392,28 @@ def reverse_geocode(lat: float, lon: float) -> Optional[Dict[str, Any]]:
 
 
 def infer_lawd_from_latlon(lawd_df: pd.DataFrame, lat: float, lon: float) -> Tuple[Optional[str], str]:
-    """Return (LAWD_CD, label) inferred from a latitude/longitude.
+    """좌표(lat, lon)로부터 LAWD_CD(법정동 5자리 시군구)와 라벨을 추정합니다.
 
-    Uses Nominatim reverse-geocode (best-effort) and matches against our LAWD list.
+    1) lawd_df에 lat/lon 컬럼이 있으면: 가장 가까운 행정구역을 거리기반으로 선택(권장/안정)
+    2) 없으면: Nominatim 역지오코딩(베스트에포트) 결과 문자열로 매칭(차단/오류 가능)
     """
     if lawd_df is None or lawd_df.empty:
         return None, "LAWD 목록이 비어있습니다"
 
+    # 1) 거리 기반 (가장 안정적)
+    if {"lat", "lon"}.issubset(set(lawd_df.columns)):
+        df = lawd_df.copy()
+        df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
+        df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
+        df = df.dropna(subset=["lat", "lon"])
+        if not df.empty:
+            df["dist"] = (df["lat"] - float(lat)) ** 2 + (df["lon"] - float(lon)) ** 2
+            row = df.sort_values("dist").iloc[0]
+            code5 = str(row["code"])[:5]
+            label = str(row.get("label", ""))
+            return code5, label if label else code5
+
+    # 2) 폴백: 역지오코딩 + 문자열 매칭
     data = reverse_geocode(lat, lon)
     if not data:
         return None, "역지오코딩 실패(네트워크/차단 가능)"
@@ -406,7 +421,6 @@ def infer_lawd_from_latlon(lawd_df: pd.DataFrame, lat: float, lon: float) -> Tup
     addr = data.get("address", {}) or {}
     metro_ko, dist_ko = _guess_korean_admin(addr)
 
-    # candidates like '서울특별시 강서구' etc.
     candidates: List[str] = []
     if metro_ko and dist_ko:
         candidates.append(f"{metro_ko} {dist_ko}")
@@ -415,20 +429,14 @@ def infer_lawd_from_latlon(lawd_df: pd.DataFrame, lat: float, lon: float) -> Tup
 
     labels = lawd_df["label"].astype(str)
 
-    for c in candidates:
-        hit = lawd_df[labels.str.contains(re.escape(c), na=False)]
+    for cand in candidates:
+        hit = lawd_df[labels.str.contains(re.escape(cand), na=False)]
         if not hit.empty:
             row = hit.iloc[0]
-            return str(row["code"]), str(row["label"])
+            return str(row["code"])[:5], str(row["label"])
 
     disp = str(data.get("display_name", ""))
-    # fallback: look for any label substring inside display_name
-    for _, row in lawd_df.iterrows():
-        lab = str(row.get("label", ""))
-        if lab and lab in disp:
-            return str(row["code"]), str(row["label"])
-
-    return None, f"시군구 자동 추정 실패: {metro_ko} {dist_ko}".strip()
+    return None, f"매칭 실패: {disp[:80]}"
 
 def static_map_url(lat: float, lon: float, zoom: int = 13, w: int = 1100, h: int = 620, markers: Optional[List[Tuple[float,float,str]]] = None) -> str:
     base = "https://staticmap.openstreetmap.de/staticmap.php"
@@ -827,23 +835,6 @@ else:
         st.session_state["market_base_supply"] = float(comp_tbl["공급환산(전용→공급)"].mean()) if not comp_tbl.empty else 0.0
     except Exception:
         st.session_state["market_base_supply"] = 0.0
-
-# 필터로 0건이면, 기간을 더 늘려 한 번 더 시도
-    if flt.empty and int(months) < 60:
-        st.info("면적/키워드 필터로 0건이라, 기간을 60개월로 확장해 한 번 더 시도합니다.")
-        merged2 = fetch_range(60)
-        if not merged2.empty:
-            flt = hogang_style_filter(merged2, float(target_m2), float(tol_m2), keyword, int(recent_n))
-
-    st.session_state["filtered_df"] = flt
-
-    if len(flt) > 0:
-        base_supply = float(flt["평당가(원/평,전용)"].mean()) * float(exclusive_ratio)
-        st.session_state["market_base_supply"] = float(base_supply)
-        types = ", ".join(sorted(set(flt["자산"].astype(str).unique()))) if "자산" in flt.columns else str(product)
-        st.success(f"{types} 실거래 {len(flt)}건 · 공급환산(매매 베이스) {fmt0(base_supply)}")
-    else:
-        st.warning("필터 적용 후 데이터가 없습니다. (면적대/키워드/최근 N건 설정을 완화해보세요)")
 
     flt_show = st.session_state.get("filtered_df", pd.DataFrame())
 
