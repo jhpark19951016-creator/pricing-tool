@@ -623,7 +623,7 @@ service_key = st.secrets.get("SERVICE_KEY", "").strip()
 cfg = RtmsConfig(service_key=service_key)
 
 # --- 법정동코드(전국/리단위) 로딩 ---
-lawd_full = load_lawd_full_codes()
+lawd_full = load_lawd_codes()
 if lawd_full is None or lawd_full.empty:
     # 네트워크 차단/다운로드 실패 시: 사용자 업로드로 대체
     with st.sidebar:
