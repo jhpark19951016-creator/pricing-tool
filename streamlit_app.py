@@ -391,8 +391,39 @@ def reverse_geocode(lat: float, lon: float) -> Optional[Dict[str, Any]]:
         return None
 
 
-def infer_lawd_from_latlon(lawd_df: pd.DataFrame, lat: float, lon: float) -> Tuple[Optional[str], str]:
-    """Return (LAWD_CD, label) inferred from a latitude/longitude.
+def infer_lawd_from_latlon(lawd_df, lat, lon):
+    """
+    좌표(lat, lon)를 기준으로
+    lawd_df 에서 가장 가까운 시군구(5자리)를 하나 선택
+    """
+
+    if lawd_df is None or lawd_df.empty:
+        return None, None
+
+    # lat/lon 컬럼 확인
+    if not {"lat", "lon"}.issubset(lawd_df.columns):
+        return None, None
+
+    # 숫자로 변환
+    df = lawd_df.copy()
+    df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
+    df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
+
+    df = df.dropna(subset=["lat", "lon"])
+    if df.empty:
+        return None, None
+
+    # 거리 계산 (단순 유클리드, 충분히 정확)
+    df["dist"] = (df["lat"] - lat) ** 2 + (df["lon"] - lon) ** 2
+
+    row = df.sort_values("dist").iloc[0]
+
+    # 실거래 API용 시군구 코드(앞 5자리)
+    lawd_cd = str(row["code"])[:5]
+    label = row["label"]
+
+    return lawd_cd, label
+
 
     Uses Nominatim reverse-geocode (best-effort) and matches against our LAWD list.
     """
