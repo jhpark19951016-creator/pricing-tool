@@ -7,7 +7,6 @@ from typing import Dict, Any, List, Tuple, Optional
 
 import requests
 import pandas as pd
-import re
 import streamlit as st
 import xmltodict
 
@@ -101,47 +100,57 @@ def parse_result_meta(xml_text: str) -> Tuple[str, str]:
         return "", ""
 
 
-def fetch_rtms_items(base_url: str, params: Dict[str, str], cfg: RtmsConfig) -> List[Dict[str, Any]]:
+def fetch_rtms_items(base_url: str, params: Dict[str, str], cfg: RtmsConfig) -> Tuple[List[Dict[str, Any]], str, str, int]:
+    """실거래 API 호출 + items를 항상 list로 정규화.
+
+    Returns (items, resultCode, resultMsg, totalCount)
+    """
     if cfg.throttle_sec:
         time.sleep(float(cfg.throttle_sec))
     try:
-        r = requests.get(base_url, params=params, timeout=cfg.timeout_sec)
-        if r.status_code == 429:
-            st.error("실거래 API 호출 한도에 도달했습니다 (HTTP 429). 기간을 줄이거나 잠시 후 다시 시도해주세요.")
-            return []
-        if r.status_code != 200:
-            rc, rm = parse_result_meta(r.text)
-            st.error(f"실거래 API 호출 실패 (HTTP {r.status_code}) / resultCode={rc or 'N/A'} / resultMsg={rm or 'N/A'}")
-            with st.expander("디버그(응답 일부)"):
-                st.code((r.text or "")[:2000])
-            return []
-        obj = xmltodict.parse(r.text)
-        resp = obj.get("response", {})
-        header = resp.get("header", {})
-        body = resp.get("body", {})
-        result_code = str(header.get("resultCode", ""))
-        result_msg = str(header.get("resultMsg", ""))
-        if result_code and result_code != "00":
-            st.warning(f"API 응답 resultCode={result_code}, resultMsg={result_msg}")
-            return []
-        items = body.get("items", {})
-        return safe_list(items.get("item"))
+        r = requests.get(base_url, params=params, timeout=float(cfg.timeout_sec))
+        r.raise_for_status()
+        x = xmltodict.parse(r.text)
+
+        resp = x.get("response", {}) if isinstance(x, dict) else {}
+        header = resp.get("header", {}) if isinstance(resp, dict) else {}
+        body = resp.get("body", {}) if isinstance(resp, dict) else {}
+
+        result_code = str(header.get("resultCode", "")) if isinstance(header, dict) else ""
+        result_msg = str(header.get("resultMsg", "")) if isinstance(header, dict) else ""
+
+        total = 0
+        try:
+            total = int(body.get("totalCount", 0)) if isinstance(body, dict) else 0
+        except Exception:
+            total = 0
+
+        items_obj = body.get("items") if isinstance(body, dict) else None
+        item = None
+        if isinstance(items_obj, dict):
+            item = items_obj.get("item")
+
+        items = safe_list(item)
+
+        ok_codes = {"00", "000", "0", ""}  # endpoint 별로 다름
+        if result_code not in ok_codes:
+            # 오류 코드면 items는 비우고 메타만 반환
+            return [], result_code, result_msg, total
+
+        return items, (result_code or "000"), (result_msg or "OK"), total
+
     except requests.exceptions.Timeout:
-        st.error("실거래 API 호출 타임아웃")
-        return []
+        return [], "TIMEOUT", "요청 시간이 초과되었습니다(Timeout)", 0
     except requests.exceptions.RequestException as e:
-        st.error(f"실거래 API 네트워크 오류: {e}")
-        return []
+        return [], "HTTPERR", f"네트워크 오류: {e}", 0
     except Exception as e:
-        st.error(f"실거래 API 파싱 오류: {e}")
-        return []
+        return [], "PARSEERR", f"응답 파싱 오류: {e}", 0
 
 
-@st.cache_data(ttl=900, show_spinner=False)
 def get_apartment_trades(cfg: RtmsConfig, lawd_cd: str, deal_ym: str) -> pd.DataFrame:
     base_url = "https://apis.data.go.kr/1613000/RTMSDataSvcAptTrade/getRTMSDataSvcAptTrade"
     params = {"serviceKey": cfg.service_key, "LAWD_CD": lawd_cd, "DEAL_YMD": deal_ym, "numOfRows": "1000", "pageNo": "1"}
-    items = fetch_rtms_items(base_url, params, cfg)
+    items, rc, msg, total = fetch_rtms_items(base_url, params, cfg)
     rows = []
     for it in items:
         rows.append({
@@ -166,7 +175,7 @@ def get_apartment_trades(cfg: RtmsConfig, lawd_cd: str, deal_ym: str) -> pd.Data
 def get_officetel_trades(cfg: RtmsConfig, lawd_cd: str, deal_ym: str) -> pd.DataFrame:
     base_url = "https://apis.data.go.kr/1613000/RTMSDataSvcOffiTrade/getRTMSDataSvcOffiTrade"
     params = {"serviceKey": cfg.service_key, "LAWD_CD": lawd_cd, "DEAL_YMD": deal_ym, "numOfRows": "1000", "pageNo": "1"}
-    items = fetch_rtms_items(base_url, params, cfg)
+    items, rc, msg, total = fetch_rtms_items(base_url, params, cfg)
     rows = []
     for it in items:
         rows.append({
@@ -203,60 +212,76 @@ def hogang_style_filter(df: pd.DataFrame, target_m2: float, tol_m2: float, keywo
 
 @st.cache_data(show_spinner=False)
 def load_lawd_codes() -> pd.DataFrame:
-    """Loads LAWD (시군구 5자리) codes.
+    """법정동코드 로드 (시군구 5자리 + 리단위까지 확장 지원)
 
-    Accepts either of these schemas:
-      - (code, name)
-      - (LAWD_CD, sido, sigungu)
+    파일 우선순위:
+      1) lawd_full.xlsx / lawd_full.csv  (리단위까지 전부 들어있는 파일)
+      2) lawd_codes.xlsx / lawd_codes.csv (기본 제공: 시군구 5자리)
+      3) 내장 최소 목록
 
-    Preference: lawd_codes.xlsx → lawd_codes.csv → built-in minimal list.
+    반환 컬럼:
+      - code: 원본 코드(리단위 등 길이 다양)
+      - label: 표시명
+      - sigungu: 실거래 API 호출용 시군구 5자리(code 앞 5자리)
     """
-    xlsx_path = "lawd_codes.xlsx"
-    csv_path = "lawd_codes.csv"
+    candidates = [
+        ("lawd_full.xlsx", "xlsx"),
+        ("lawd_full.csv", "csv"),
+        ("lawd_codes.xlsx", "xlsx"),
+        ("lawd_codes.csv", "csv"),
+    ]
 
     df = None
-    try:
-        if os.path.exists(xlsx_path):
-            df = pd.read_excel(xlsx_path, dtype=str)
-        elif os.path.exists(csv_path):
-            df = pd.read_csv(csv_path, dtype=str)
-    except Exception:
-        df = None
+    for path, kind in candidates:
+        try:
+            if os.path.exists(path):
+                if kind == "xlsx":
+                    df = pd.read_excel(path, dtype=str)
+                else:
+                    df = pd.read_csv(path, dtype=str)
+                if df is not None and not df.empty:
+                    break
+        except Exception:
+            df = None
 
     if df is None or df.empty:
-        df = pd.DataFrame([{"code": "11110", "label": "서울특별시 종로구"}])
+        df = pd.DataFrame([
+            {"code": "11140", "label": "서울특별시 중구"},
+            {"code": "27110", "label": "대구광역시 중구"},
+            {"code": "28185", "label": "인천광역시 연수구"},
+        ])
 
-    cols = set([c.lower() for c in df.columns])
+    cols_l = {c.lower(): c for c in df.columns}
 
-    # Normalize to columns: code, label
-    if "code" in cols and ("name" in cols or "label" in cols):
-        # already (code, name/label)
-        if "name" in df.columns:
-            df = df.rename(columns={"name": "label"})
-        df["code"] = df["code"].astype(str).str.zfill(5)
-        df["label"] = df["label"].astype(str)
-        out = df[["code", "label"]].dropna().drop_duplicates().sort_values("label")
-        return out.reset_index(drop=True)
+    # Normalize to (code,label)
+    if "code" in cols_l and ("label" in cols_l or "name" in cols_l):
+        c_code = cols_l["code"]
+        c_label = cols_l.get("label", cols_l.get("name"))
+        out = df[[c_code, c_label]].rename(columns={c_code: "code", c_label: "label"}).copy()
+    elif "lawd_cd" in cols_l and "sido" in cols_l and "sigungu" in cols_l:
+        out = df[[cols_l["lawd_cd"], cols_l["sido"], cols_l["sigungu"]]].copy()
+        out["code"] = out[cols_l["lawd_cd"]].astype(str)
+        out["label"] = (out[cols_l["sido"]].astype(str) + " " + out[cols_l["sigungu"]].astype(str)).str.strip()
+        out = out[["code", "label"]]
+    else:
+        out = df.iloc[:, :2].copy()
+        out.columns = ["code", "label"]
 
-    if ("lawd_cd" in cols) and ("sido" in cols) and ("sigungu" in cols):
-        # (LAWD_CD, sido, sigungu)
-        rename = {}
-        for c in df.columns:
-            if c.lower() == "lawd_cd":
-                rename[c] = "code"
-            elif c.lower() == "sido":
-                rename[c] = "sido"
-            elif c.lower() == "sigungu":
-                rename[c] = "sigungu"
-        df = df.rename(columns=rename)
-        df["code"] = df["code"].astype(str).str.zfill(5)
-        df["label"] = (df["sido"].fillna("").astype(str).str.strip() + " " + df["sigungu"].fillna("").astype(str).str.strip()).str.strip()
-        out = df[["code", "label"]].dropna().drop_duplicates().sort_values("label")
-        return out.reset_index(drop=True)
+    out["code"] = out["code"].astype(str).str.strip()
+    out["label"] = out["label"].astype(str).str.strip()
 
-    # Fallback minimal
-    return pd.DataFrame([{"code": "11110", "label": "서울특별시 종로구"}])
-@st.cache_data(ttl=86400, show_spinner=False)
+    # 실거래 API는 시군구 5자리
+    out["sigungu"] = (
+        out["code"]
+        .str.replace(r"\D", "", regex=True)
+        .str.slice(0, 5)
+        .str.zfill(5)
+    )
+
+    out = out.dropna().drop_duplicates(subset=["code", "label"]).sort_values(["label", "code"]).reset_index(drop=True)
+    return out
+
+
 def geocode_address(addr: str) -> Optional[Dict[str, float]]:
     if not addr.strip():
         return None
@@ -369,8 +394,7 @@ def reverse_geocode(lat: float, lon: float) -> Optional[Dict[str, Any]]:
 def infer_lawd_from_latlon(lawd_df: pd.DataFrame, lat: float, lon: float) -> Tuple[Optional[str], str]:
     """Return (LAWD_CD, label) inferred from a latitude/longitude.
 
-    - Nominatim reverse-geocode (best-effort)
-    - 중복 구명(중구/서구/동구 등) 오판정 방지: '광역(서울/대구..)+시군구' 동시 매칭을 1순위로
+    Uses Nominatim reverse-geocode (best-effort) and matches against our LAWD list.
     """
     if lawd_df is None or lawd_df.empty:
         return None, "LAWD 목록이 비어있습니다"
@@ -382,65 +406,14 @@ def infer_lawd_from_latlon(lawd_df: pd.DataFrame, lat: float, lon: float) -> Tup
     addr = data.get("address", {}) or {}
     metro_ko, dist_ko = _guess_korean_admin(addr)
 
-    labels = lawd_df["label"].astype(str)
-
-    # 광역 토큰(서울/대구...)을 '서울특별시/서울'처럼 여러 형태로 잡아 오판정 방지
-    metro_tokens: List[str] = []
-    if metro_ko:
-        metro_tokens.append(metro_ko)
-        # 대표 케이스 보정
-        if metro_ko == "서울":
-            metro_tokens.insert(0, "서울특별시")
-        elif metro_ko == "부산":
-            metro_tokens.insert(0, "부산광역시")
-        elif metro_ko == "대구":
-            metro_tokens.insert(0, "대구광역시")
-        elif metro_ko == "인천":
-            metro_tokens.insert(0, "인천광역시")
-        elif metro_ko == "광주":
-            metro_tokens.insert(0, "광주광역시")
-        elif metro_ko == "대전":
-            metro_tokens.insert(0, "대전광역시")
-        elif metro_ko == "울산":
-            metro_tokens.insert(0, "울산광역시")
-        elif metro_ko == "세종":
-            metro_tokens.insert(0, "세종특별자치시")
-        elif metro_ko == "경기":
-            metro_tokens.insert(0, "경기도")
-        elif metro_ko == "강원":
-            metro_tokens.insert(0, "강원특별자치도")
-        elif metro_ko == "충북":
-            metro_tokens.insert(0, "충청북도")
-        elif metro_ko == "충남":
-            metro_tokens.insert(0, "충청남도")
-        elif metro_ko == "전북":
-            metro_tokens.insert(0, "전북특별자치도")
-        elif metro_ko == "전남":
-            metro_tokens.insert(0, "전라남도")
-        elif metro_ko == "경북":
-            metro_tokens.insert(0, "경상북도")
-        elif metro_ko == "경남":
-            metro_tokens.insert(0, "경상남도")
-        elif metro_ko == "제주":
-            metro_tokens.insert(0, "제주특별자치도")
-
-    # 1) 최우선: 광역 + 시군구 동시 매칭 (중구 중복 방지)
-    if dist_ko and metro_tokens:
-        for mt in metro_tokens:
-            hit = lawd_df[
-                labels.str.contains(re.escape(mt), na=False)
-                & labels.str.contains(re.escape(dist_ko), na=False)
-            ]
-            if not hit.empty:
-                row = hit.iloc[0]
-                return str(row["code"]), str(row["label"])
-
-    # 2) 차선: '광역 시군구' 형태로 직접 포함검색
+    # candidates like '서울특별시 강서구' etc.
     candidates: List[str] = []
-    if metro_tokens and dist_ko:
-        candidates.extend([f"{mt} {dist_ko}" for mt in metro_tokens])
+    if metro_ko and dist_ko:
+        candidates.append(f"{metro_ko} {dist_ko}")
     if dist_ko:
         candidates.append(dist_ko)
+
+    labels = lawd_df["label"].astype(str)
 
     for c in candidates:
         hit = lawd_df[labels.str.contains(re.escape(c), na=False)]
@@ -448,8 +421,8 @@ def infer_lawd_from_latlon(lawd_df: pd.DataFrame, lat: float, lon: float) -> Tup
             row = hit.iloc[0]
             return str(row["code"]), str(row["label"])
 
-    # 3) 마지막: display_name 전체에서 label이 통으로 들어간 경우
     disp = str(data.get("display_name", ""))
+    # fallback: look for any label substring inside display_name
     for _, row in lawd_df.iterrows():
         lab = str(row.get("label", ""))
         if lab and lab in disp:
@@ -750,7 +723,8 @@ with left:
     inferred_cd, inferred_label = infer_lawd_from_latlon(lawd_df, geo["lat"], geo["lon"])
     if inferred_cd:
         st.success(f"자동 추정 시군구: {inferred_label}")
-        lawd_cd = inferred_cd
+        selected_lawd_code = str(inferred_cd)
+        lawd_cd = str(inferred_cd).replace('-', '')[:5].zfill(5)
         lawd_label = inferred_label
     else:
         st.warning(f"시군구 자동 추정 실패: {inferred_label}")
@@ -764,7 +738,9 @@ with left:
                 st.info("검색 결과가 없습니다. lawd_codes.xlsx에 지역을 추가하세요.")
                 view = lawd_df
         sel = st.selectbox("시군구 선택(수동)", view["label"].tolist(), index=0, key="fallback_lawd")
-        lawd_cd = view[view["label"] == sel]["code"].iloc[0]
+        sel_row = view[view["label"] == sel].iloc[0]
+        lawd_cd = str(sel_row.get("sigungu", sel_row.get("code","")))
+        selected_lawd_code = str(sel_row.get("code",""))
         lawd_label = sel
 
     st.divider()
@@ -822,12 +798,37 @@ with left:
                             st.info(f"기간을 {m2}개월로 확장하여 실거래 {len(merged)}건을 찾았습니다.")
                             break
 
-            if merged.empty:
-                st.warning("조회된 실거래가가 없습니다. (지역/기간/면적대/키워드를 확인해주세요)")
-            else:
-                flt = hogang_style_filter(merged, float(target_m2), float(tol_m2), keyword, int(recent_n))
+            
+st.subheader("조회 결과")
 
-                # 필터로 0건이면, 기간을 더 늘려 한 번 더 시도
+if merged.empty:
+    # 표 형식으로 '없음' 표시
+    st.dataframe(pd.DataFrame([{"상태": "조회된 실거래가가 없습니다", "안내": "지역/기간/면적대/키워드를 확인해주세요"}]), use_container_width=True)
+    st.session_state["filtered_df"] = pd.DataFrame()
+    st.session_state["market_base_supply"] = 0.0
+else:
+    st.caption(f"원본(기간 합산) {len(merged):,}건")
+    st.dataframe(merged.sort_values(["거래일", "거래금액(만원)"], ascending=[False, False]).head(300), use_container_width=True)
+
+    flt = hogang_style_filter(merged, float(target_m2), float(tol_m2), keyword, int(recent_n))
+    st.caption(f"필터 적용 {len(flt):,}건 (전용 {target_m2}±{tol_m2}㎡, 키워드/최근N 적용)")
+
+    if flt.empty:
+        st.dataframe(pd.DataFrame([{"상태": "필터 조건에서 거래가 없습니다", "안내": "허용오차를 늘리거나 키워드를 비우고 다시 조회해보세요"}]), use_container_width=True)
+    else:
+        st.dataframe(flt.sort_values(["거래일", "거래금액(만원)"], ascending=[False, False]).head(300), use_container_width=True)
+
+    # 세션 저장(지도 마커/보고서에서 재사용)
+    st.session_state["filtered_df"] = flt
+
+    # 시장 기준(공급환산) 계산용
+    try:
+        comp_tbl = build_comp_table(flt, float(exclusive_ratio), topn=200)
+        st.session_state["market_base_supply"] = float(comp_tbl["공급환산(전용→공급)"].mean()) if not comp_tbl.empty else 0.0
+    except Exception:
+        st.session_state["market_base_supply"] = 0.0
+
+# 필터로 0건이면, 기간을 더 늘려 한 번 더 시도
                 if flt.empty and int(months) < 60:
                     st.info("면적/키워드 필터로 0건이라, 기간을 60개월로 확장해 한 번 더 시도합니다.")
                     merged2 = fetch_range(60)
