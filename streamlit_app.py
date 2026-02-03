@@ -832,23 +832,23 @@ with left:
             
 st.subheader("조회 결과")
 
-if final_df is None or final_df.empty:
-    # 표 형식으로 '없음' 표시
-    st.dataframe(pd.DataFrame([{"상태": "조회된 실거래가가 없습니다", "안내": "지역/기간/면적대/키워드를 확인해주세요"}]), use_container_width=True)
+if merged is None or merged.empty:
+    st.dataframe(pd.DataFrame([{"상태":"조회된 실거래가가 없습니다", "안내":"지역/기간/면적대/키워드를 확인해주세요"}]), use_container_width=True)
     st.session_state["filtered_df"] = pd.DataFrame()
     st.session_state["market_base_supply"] = 0.0
 else:
     st.caption(f"원본(기간 합산) {len(merged):,}건")
-    st.dataframe(merged.sort_values(["거래일", "거래금액(만원)"], ascending=[False, False]).head(300), use_container_width=True)
+    st.dataframe(merged.sort_values(["거래일","거래금액(만원)"], ascending=[False, False]).head(300), use_container_width=True)
 
     flt = hogang_style_filter(merged, float(target_m2), float(tol_m2), keyword, int(recent_n))
     st.caption(f"필터 적용 {len(flt):,}건 (전용 {target_m2}±{tol_m2}㎡, 키워드/최근N 적용)")
 
     if flt.empty:
-        st.dataframe(pd.DataFrame([{"상태": "필터 조건에서 거래가 없습니다", "안내": "허용오차를 늘리거나 키워드를 비우고 다시 조회해보세요"}]), use_container_width=True)
+        st.dataframe(pd.DataFrame([{"상태":"필터 조건에서 거래가 없습니다", "안내":"허용오차를 늘리거나 키워드를 비우고 다시 조회해보세요"}]), use_container_width=True)
     else:
-        st.dataframe(flt.sort_values(["거래일", "거래금액(만원)"], ascending=[False, False]).head(300), use_container_width=True)
+        st.dataframe(flt.sort_values(["거래일","거래금액(만원)"], ascending=[False, False]).head(300), use_container_width=True)
 
+    
     # 세션 저장(지도 마커/보고서에서 재사용)
     st.session_state["filtered_df"] = flt
 
