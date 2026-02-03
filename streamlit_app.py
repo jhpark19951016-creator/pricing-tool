@@ -1,13 +1,23 @@
 import os
+import io
+import time
 import datetime as dt
-import math
 from dataclasses import dataclass
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
 import requests
 import pandas as pd
 import streamlit as st
 import xmltodict
+
+import matplotlib.pyplot as plt
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 
 M2_PER_PYEONG = 3.305785
 
@@ -64,16 +74,18 @@ def safe_list(x):
     return x if isinstance(x, list) else [x]
 
 
+def fmt0(x: float) -> str:
+    try:
+        return f"{int(round(float(x))):,}"
+    except Exception:
+        return "-"
+
+
 @dataclass
 class RtmsConfig:
     service_key: str
     timeout_sec: int = 25
-
-
-def _mask_service_key(s: str) -> str:
-    if not s:
-        return ""
-    return s[:6] + "..." + s[-6:] if len(s) > 20 else "***"
+    throttle_sec: float = 0.25
 
 
 def parse_result_meta(xml_text: str) -> Tuple[str, str]:
@@ -85,25 +97,18 @@ def parse_result_meta(xml_text: str) -> Tuple[str, str]:
         return "", ""
 
 
-def fetch_rtms_items(base_url: str, params: Dict[str, str], timeout: int = 25) -> List[Dict[str, Any]]:
-    """
-    Robust fetch:
-    - Never hard-crash the app on HTTP errors
-    - Show actionable debug info (status, resultCode/resultMsg) without leaking serviceKey
-    """
+def fetch_rtms_items(base_url: str, params: Dict[str, str], cfg: RtmsConfig) -> List[Dict[str, Any]]:
+    if cfg.throttle_sec:
+        time.sleep(float(cfg.throttle_sec))
     try:
-        r = requests.get(base_url, params=params, timeout=timeout)
+        r = requests.get(base_url, params=params, timeout=cfg.timeout_sec)
+        if r.status_code == 429:
+            st.error("실거래 API 호출 한도에 도달했습니다 (HTTP 429). 기간을 줄이거나 잠시 후 다시 시도해주세요.")
+            return []
         if r.status_code != 200:
             rc, rm = parse_result_meta(r.text)
-            st.error(
-                "실거래 API 호출이 실패했습니다. "
-                f"(HTTP {r.status_code})\n\n"
-                f"- resultCode: {rc or 'N/A'}\n"
-                f"- resultMsg: {rm or 'N/A'}\n\n"
-                "가능 원인: 서비스키(디코딩/인코딩) 문제, 호출 한도 초과, "
-                "파라미터 오류(LAWD_CD/DEAL_YMD), 또는 일시적 서버 오류입니다."
-            )
-            with st.expander("디버그(응답 일부 보기)"):
+            st.error(f"실거래 API 호출 실패 (HTTP {r.status_code}) / resultCode={rc or 'N/A'} / resultMsg={rm or 'N/A'}")
+            with st.expander("디버그(응답 일부)"):
                 st.code((r.text or "")[:2000])
             return []
         obj = xmltodict.parse(r.text)
@@ -118,28 +123,21 @@ def fetch_rtms_items(base_url: str, params: Dict[str, str], timeout: int = 25) -
         items = body.get("items", {})
         return safe_list(items.get("item"))
     except requests.exceptions.Timeout:
-        st.error("실거래 API 호출이 타임아웃되었습니다. (잠시 후 다시 시도해주세요)")
+        st.error("실거래 API 호출 타임아웃")
         return []
     except requests.exceptions.RequestException as e:
-        st.error(f"실거래 API 호출 중 네트워크 오류가 발생했습니다: {e}")
+        st.error(f"실거래 API 네트워크 오류: {e}")
         return []
     except Exception as e:
-        st.error(f"실거래 API 응답 파싱 중 오류가 발생했습니다: {e}")
+        st.error(f"실거래 API 파싱 오류: {e}")
         return []
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def get_apartment_trades(cfg: RtmsConfig, lawd_cd: str, deal_ym: str) -> pd.DataFrame:
     base_url = "https://apis.data.go.kr/1613000/RTMSDataSvcAptTradeDev/getRTMSDataSvcAptTradeDev"
-    params = {
-        "serviceKey": cfg.service_key,
-        "LAWD_CD": lawd_cd,
-        "DEAL_YMD": deal_ym,
-        "numOfRows": "1000",
-        "pageNo": "1",
-    }
-    items = fetch_rtms_items(base_url, params, timeout=cfg.timeout_sec)
-
+    params = {"serviceKey": cfg.service_key, "LAWD_CD": lawd_cd, "DEAL_YMD": deal_ym, "numOfRows": "1000", "pageNo": "1"}
+    items = fetch_rtms_items(base_url, params, cfg)
     rows = []
     for it in items:
         rows.append({
@@ -155,29 +153,16 @@ def get_apartment_trades(cfg: RtmsConfig, lawd_cd: str, deal_ym: str) -> pd.Data
         })
     df = pd.DataFrame(rows)
     if not df.empty:
-        df["거래일자"] = pd.to_datetime(
-            df["거래년"].astype(str) + "-" + df["거래월"].astype(str) + "-" + df["거래일"].astype(str),
-            errors="coerce"
-        )
-        df["평당가(원/평,전용)"] = df.apply(
-            lambda r: won_per_pyeong_from_trade(int(r["거래금액(만원)"]), float(r["전용㎡"])),
-            axis=1
-        )
+        df["거래일자"] = pd.to_datetime(df["거래년"].astype(str) + "-" + df["거래월"].astype(str) + "-" + df["거래일"].astype(str), errors="coerce")
+        df["평당가(원/평,전용)"] = df.apply(lambda r: won_per_pyeong_from_trade(int(r["거래금액(만원)"]), float(r["전용㎡"])), axis=1)
     return df
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def get_officetel_trades(cfg: RtmsConfig, lawd_cd: str, deal_ym: str) -> pd.DataFrame:
     base_url = "https://apis.data.go.kr/1613000/RTMSDataSvcOffiTrade/getRTMSDataSvcOffiTrade"
-    params = {
-        "serviceKey": cfg.service_key,
-        "LAWD_CD": lawd_cd,
-        "DEAL_YMD": deal_ym,
-        "numOfRows": "1000",
-        "pageNo": "1",
-    }
-    items = fetch_rtms_items(base_url, params, timeout=cfg.timeout_sec)
-
+    params = {"serviceKey": cfg.service_key, "LAWD_CD": lawd_cd, "DEAL_YMD": deal_ym, "numOfRows": "1000", "pageNo": "1"}
+    items = fetch_rtms_items(base_url, params, cfg)
     rows = []
     for it in items:
         rows.append({
@@ -193,14 +178,8 @@ def get_officetel_trades(cfg: RtmsConfig, lawd_cd: str, deal_ym: str) -> pd.Data
         })
     df = pd.DataFrame(rows)
     if not df.empty:
-        df["거래일자"] = pd.to_datetime(
-            df["거래년"].astype(str) + "-" + df["거래월"].astype(str) + "-" + df["거래일"].astype(str),
-            errors="coerce"
-        )
-        df["평당가(원/평,전용)"] = df.apply(
-            lambda r: won_per_pyeong_from_trade(int(r["거래금액(만원)"]), float(r["전용㎡"])),
-            axis=1
-        )
+        df["거래일자"] = pd.to_datetime(df["거래년"].astype(str) + "-" + df["거래월"].astype(str) + "-" + df["거래일"].astype(str), errors="coerce")
+        df["평당가(원/평,전용)"] = df.apply(lambda r: won_per_pyeong_from_trade(int(r["거래금액(만원)"]), float(r["전용㎡"])), axis=1)
     return df
 
 
@@ -223,44 +202,240 @@ def load_lawd_codes() -> pd.DataFrame:
     path = "lawd_codes.csv"
     if os.path.exists(path):
         df = pd.read_csv(path, dtype={"code": str})
-        if "code" not in df.columns or "name" not in df.columns:
-            return pd.DataFrame([{"code": "11110", "name": "서울 종로구", "label": "서울 종로구 (11110)"}])
         df["code"] = df["code"].astype(str).str.zfill(5)
         df["label"] = df["name"].astype(str) + " (" + df["code"] + ")"
         return df.sort_values(["name", "code"]).reset_index(drop=True)
     return pd.DataFrame([{"code": "11110", "name": "서울 종로구", "label": "서울 종로구 (11110)"}])
 
 
-def fmt0(x: float) -> str:
+@st.cache_data(ttl=86400, show_spinner=False)
+def geocode_address(addr: str) -> Optional[Dict[str, float]]:
+    if not addr.strip():
+        return None
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {"q": addr, "format": "json", "limit": 1}
+    headers = {"User-Agent": "pricing-tool/1.0 (streamlit)"}
     try:
-        return f"{int(round(float(x))):,}"
+        r = requests.get(url, params=params, headers=headers, timeout=15)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        if not data:
+            return None
+        return {"lat": float(data[0]["lat"]), "lon": float(data[0]["lon"])}
     except Exception:
-        return "-"
+        return None
+
+
+def static_map_url(lat: float, lon: float, zoom: int = 13, w: int = 1100, h: int = 620, markers: Optional[List[Tuple[float,float,str]]] = None) -> str:
+    base = "https://staticmap.openstreetmap.de/staticmap.php"
+    parts = [f"center={lat},{lon}", f"zoom={zoom}", f"size={w}x{h}", "maptype=mapnik"]
+    if markers:
+        for la, lo, c in markers:
+            parts.append(f"markers={la},{lo},{c}1")
+    else:
+        parts.append(f"markers={lat},{lon},red1")
+    return base + "?" + "&".join(parts)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def download_image(url: str) -> Optional[bytes]:
+    try:
+        r = requests.get(url, timeout=20, headers={"User-Agent": "pricing-tool/1.0 (streamlit)"})
+        if r.status_code != 200:
+            return None
+        return r.content
+    except Exception:
+        return None
+
+
+LOCATION_PRESETS = {"도심 핵심(최상)": 1.12, "도심/중심권(상)": 1.06, "일반 주거권(중)": 1.00, "외곽/신도시(하)": 0.95, "입지 열위(최하)": 0.90}
+BRAND_PRESETS = {"하이엔드(상급 라인)": 1.06, "상급(10대 브랜드 일반)": 1.03, "중급(지역 상위/준대형)": 1.00, "기타/무브랜드": 0.97}
+
+
+def build_location_multiplier(grade_mult: float, subway_min: int, school_min: int, infra_min: int, dev: str,
+                              w_subway: float, w_school: float, w_infra: float, w_dev: float) -> float:
+    def score_by_min(m: int) -> float:
+        if m <= 5: return 1.08
+        if m <= 10: return 1.04
+        if m <= 15: return 1.00
+        if m <= 20: return 0.97
+        return 0.94
+    s_sub = score_by_min(subway_min)
+    s_sch = score_by_min(school_min)
+    s_inf = score_by_min(infra_min)
+    s_dev = 1.00 if dev == "없음" else (1.03 if dev == "보통" else 1.06)
+    w_total = max(1e-9, (w_subway + w_school + w_infra + w_dev))
+    adj = (s_sub * w_subway + s_sch * w_school + s_inf * w_infra + s_dev * w_dev) / w_total
+    return float(max(0.85, min(1.20, grade_mult * adj)))
+
+
+def make_bar_chart_monthly_counts(df: pd.DataFrame) -> bytes:
+    if df.empty:
+        return b""
+    tmp = df.copy()
+    tmp["ym"] = tmp["거래일자"].dt.to_period("M").astype(str)
+    g = tmp.groupby("ym").size().reset_index(name="count")
+    g["ym_sort"] = pd.to_datetime(g["ym"] + "-01", errors="coerce")
+    g = g.sort_values("ym_sort")
+    fig = plt.figure(figsize=(7.2, 2.6), dpi=160)
+    ax = fig.add_subplot(111)
+    ax.bar(g["ym"], g["count"])
+    ax.set_title("월별 거래건수")
+    ax.tick_params(axis='x', rotation=45)
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def register_korean_font():
+    candidates = [
+        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            try:
+                pdfmetrics.registerFont(TTFont("KFONT", p))
+                return "KFONT"
+            except Exception:
+                continue
+    return None
+
+
+def build_comp_table(filtered: pd.DataFrame, exclusive_ratio: float, topn: int = 10) -> pd.DataFrame:
+    if filtered.empty:
+        return pd.DataFrame()
+    g = filtered.groupby("단지명").agg(건수=("단지명", "size"), 평당가_전용=("평당가(원/평,전용)", "mean")).reset_index()
+    g = g.sort_values(["건수", "평당가_전용"], ascending=[False, False]).head(topn)
+    g["공급환산(전용→공급)"] = g["평당가_전용"] * float(exclusive_ratio)
+    g = g.rename(columns={"평당가_전용": "평당가(전용)"})
+    return g
+
+
+def build_pdf_report(title: str, target_addr: str, geo: Optional[Dict[str, float]], product: str, lawd_label: str,
+                     params_summary: Dict[str, Any], comp_table: pd.DataFrame, market_base_supply: float,
+                     loc_mult: float, brand_mult: float, final_supply: float, map_png: Optional[bytes], chart_png: Optional[bytes]) -> bytes:
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=14*mm, rightMargin=14*mm, topMargin=14*mm, bottomMargin=14*mm)
+    font = register_korean_font()
+    styles = getSampleStyleSheet()
+    if font:
+        styles.add(ParagraphStyle(name="KTitle", parent=styles["Title"], fontName=font, fontSize=20, leading=24, spaceAfter=8))
+        styles.add(ParagraphStyle(name="KH2", parent=styles["Heading2"], fontName=font, fontSize=13, leading=16, spaceBefore=8, spaceAfter=6))
+        styles.add(ParagraphStyle(name="KBody", parent=styles["BodyText"], fontName=font, fontSize=10.5, leading=14))
+        styles.add(ParagraphStyle(name="KSmall", parent=styles["BodyText"], fontName=font, fontSize=9.2, leading=12, textColor=colors.grey))
+        T, H2, B, S = styles["KTitle"], styles["KH2"], styles["KBody"], styles["KSmall"]
+    else:
+        T, H2, B, S = styles["Title"], styles["Heading2"], styles["BodyText"], styles["BodyText"]
+
+    story = []
+    story.append(Paragraph(title, T))
+    story.append(Paragraph(f"기준일: {dt.date.today().isoformat()} · 상품: {product} · 지역: {lawd_label}", S))
+    story.append(Spacer(1, 6))
+
+    story.append(Paragraph("1. 사업 개요", H2))
+    txt = f"대상지 주소: {target_addr or '-'}"
+    if geo:
+        txt += f"<br/>좌표: {geo['lat']:.6f}, {geo['lon']:.6f}"
+    story.append(Paragraph(txt, B))
+    story.append(Spacer(1, 6))
+    if map_png:
+        img = RLImage(io.BytesIO(map_png))
+        img.drawHeight = 70*mm
+        img.drawWidth = 180*mm
+        story.append(img)
+    else:
+        story.append(Paragraph("지도 이미지를 불러오지 못했습니다.", S))
+    story.append(Spacer(1, 10))
+
+    story.append(Paragraph("2. 입지 분석", H2))
+    story.append(Paragraph(f"입지 가중치: <b>{loc_mult:.3f}</b><br/>브랜드 가중치: <b>{brand_mult:.3f}</b>", B))
+    story.append(Spacer(1, 6))
+
+    story.append(Paragraph("3. 시장 환경", H2))
+    story.append(Paragraph("국토부 실거래(매매) 데이터를 기반으로 면적대 필터 후 집계했습니다.", B))
+    story.append(Spacer(1, 6))
+    if chart_png:
+        cimg = RLImage(io.BytesIO(chart_png))
+        cimg.drawHeight = 45*mm
+        cimg.drawWidth = 180*mm
+        story.append(cimg)
+    else:
+        story.append(Paragraph("거래 추이 차트를 생성하지 못했습니다.", S))
+    story.append(Spacer(1, 10))
+
+    story.append(Paragraph("4. 인근 시세 현황 (비교 단지)", H2))
+    if comp_table is not None and not comp_table.empty:
+        cols = ["단지명", "건수", "평당가(전용)", "공급환산(전용→공급)"]
+        data = [cols]
+        for _, r in comp_table.iterrows():
+            data.append([str(r["단지명"]), str(int(r["건수"])), f"{fmt0(float(r['평당가(전용)']))}", f"{fmt0(float(r['공급환산(전용→공급)']))}"])
+        tbl = Table(data, colWidths=[70*mm, 15*mm, 40*mm, 45*mm])
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#1f4e79")),
+            ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+            ("FONTNAME", (0,0), (-1,0), font or "Helvetica-Bold"),
+            ("FONTSIZE", (0,0), (-1,0), 9.5),
+            ("GRID", (0,0), (-1,-1), 0.25, colors.lightgrey),
+            ("FONTSIZE", (0,1), (-1,-1), 9.2),
+            ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.whitesmoke, colors.white]),
+        ]))
+        story.append(tbl)
+    else:
+        story.append(Paragraph("비교 단지 집계 결과가 없습니다.", S))
+    story.append(Spacer(1, 10))
+
+    story.append(Paragraph("5. 분양가 산정 결과 (공급기준)", H2))
+    result_rows = [
+        ["구분", "값"],
+        ["베이스(주변 매매 공급환산)", f"{fmt0(market_base_supply)} 원/평"],
+        ["입지 가중치", f"{loc_mult:.3f}"],
+        ["브랜드 가중치", f"{brand_mult:.3f}"],
+        ["산정 분양가(공급)", f"{fmt0(final_supply)} 원/평"],
+    ]
+    rtbl = Table(result_rows, colWidths=[55*mm, 125*mm])
+    rtbl.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#2f5597")),
+        ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+        ("FONTNAME", (0,0), (-1,0), font or "Helvetica-Bold"),
+        ("FONTSIZE", (0,0), (-1,0), 10),
+        ("GRID", (0,0), (-1,-1), 0.25, colors.lightgrey),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.whitesmoke, colors.white]),
+    ]))
+    story.append(rtbl)
+    story.append(Spacer(1, 8))
+
+    story.append(Paragraph("부록. 입력 파라미터", H2))
+    p_lines = [f"- {k}: {v}" for k, v in params_summary.items()]
+    story.append(Paragraph("<br/>".join(p_lines), B))
+
+    doc.build(story)
+    return buf.getvalue()
 
 
 # -----------------------------
 # UI
 # -----------------------------
-st.set_page_config(page_title="분양가 산정 Tool", layout="wide")
-st.title("분양가 산정 Tool (일반 사업성 + 상한제 + 실거래 자동)")
-st.caption("회사 PC에서도 URL로 사용. 주변시세는 국토부 실거래가 OpenAPI를 자동 조회합니다.")
+st.set_page_config(page_title="분양가 산정 Tool (보고서 생성)", layout="wide")
+st.title("분양가 산정 Tool — 보고서 자동 생성 (시세·입지·브랜드 기반)")
+st.caption("대상지 위치/조건 입력 → 실거래 자동 조회 → ‘보고서(PDF)’ 형식으로 결과를 출력합니다.")
 
 service_key = st.secrets.get("SERVICE_KEY", "").strip()
-
-with st.sidebar:
-    st.subheader("설정")
-    st.caption("서비스키는 Secrets에서 읽습니다. (표시는 마스킹)")
-    st.code(_mask_service_key(service_key))
-
-if not service_key:
-    st.warning("SERVICE_KEY가 설정되지 않았습니다. (Streamlit Cloud → App settings → Secrets에 넣어주세요)")
-
 cfg = RtmsConfig(service_key=service_key)
 lawd_df = load_lawd_codes()
 
 with st.sidebar:
-    st.subheader("주변 시세 자동 (실거래)")
-    q = st.text_input("지역 검색(선택)", value="", key="sidebar_search")
+    st.subheader("대상지 입력")
+    report_title = st.text_input("보고서 제목", value="사업지 시장조사 보고", key="r_title")
+    target_name = st.text_input("사업명/메모(선택)", value="", key="t_name")
+    target_addr = st.text_input("대상지 주소(지도)", value="", key="t_addr")
+
+    st.divider()
+    st.subheader("상품/지역/기간")
+    q = st.text_input("지역 검색(선택)", value="", key="s_search")
     view = lawd_df
     if q.strip():
         qq = q.strip().lower()
@@ -268,133 +443,166 @@ with st.sidebar:
         if view.empty:
             st.info("검색 결과가 없습니다. lawd_codes.csv에 지역을 추가하세요.")
             view = lawd_df
-
-    sel = st.selectbox("법정동코드(시군구 5자리) 선택", view["label"].tolist(), index=0, key="sidebar_lawd_select")
+    sel = st.selectbox("법정동코드(시군구 5자리)", view["label"].tolist(), index=0, key="s_lawd")
     lawd_cd = view[view["label"] == sel]["code"].iloc[0]
+    lawd_label = sel
 
-    end_ym = st.text_input("기준 계약년월(YYYYMM)", value=dt.date.today().strftime("%Y%m"), key="sidebar_endym")
-    months = st.number_input("최근 기간(개월)", min_value=1, max_value=36, value=12, step=1, key="sidebar_months")
-    assets = st.multiselect("조회 대상", ["아파트", "오피스텔"], default=["아파트", "오피스텔"], key="sidebar_assets")
-
-    st.divider()
-    st.subheader("호갱노노식 집계")
-    target_m2 = st.number_input("기준 전용면적(㎡)", min_value=10.0, max_value=300.0, value=84.0, step=1.0, key="sidebar_target_m2")
-    tol_m2 = st.number_input("허용오차(±㎡)", min_value=0.0, max_value=20.0, value=3.0, step=0.5, key="sidebar_tol_m2")
-    keyword = st.text_input("단지명 키워드(선택)", value="", key="sidebar_keyword")
-    recent_n = st.number_input("최근 N건 (0=미사용)", min_value=0, max_value=200, value=30, step=5, key="sidebar_recent_n")
+    product = st.selectbox("상품", ["아파트", "오피스텔"], index=0, key="s_product")
+    end_ym = st.text_input("기준 계약년월(YYYYMM)", value=dt.date.today().strftime("%Y%m"), key="s_endym")
+    months = st.number_input("최근 기간(개월)", min_value=1, max_value=36, value=12, step=1, key="s_months")
 
     st.divider()
-    st.subheader("시세 → 분양가(공급기준)")
-    exclusive_ratio = st.number_input("전용률(전용/공급) 예: 0.70", min_value=0.50, max_value=0.95, value=0.70, step=0.01, key="sidebar_excl_ratio")
-    alpha = st.number_input("시세 반영계수 α", min_value=0.50, max_value=1.50, value=0.98, step=0.01, key="sidebar_alpha")
-    beta = st.number_input("상품 프리미엄/디스카운트 β", min_value=0.70, max_value=1.30, value=1.00, step=0.01, key="sidebar_beta")
+    st.subheader("면적대/필터")
+    target_m2 = st.number_input("기준 전용면적(㎡)", min_value=10.0, max_value=300.0, value=84.0, step=1.0, key="s_m2")
+    tol_m2 = st.number_input("허용오차(±㎡)", min_value=0.0, max_value=20.0, value=3.0, step=0.5, key="s_tol")
+    keyword = st.text_input("단지명 키워드(선택)", value="", key="s_kw")
+    recent_n = st.number_input("최근 N건 (0=미사용)", min_value=0, max_value=200, value=50, step=5, key="s_n")
 
-col1, col2 = st.columns(2)
+    st.divider()
+    st.subheader("전용→공급 환산")
+    exclusive_ratio = st.number_input("전용률(전용/공급)", min_value=0.50, max_value=0.95, value=0.70, step=0.01, key="s_exratio")
 
-with col1:
-    st.subheader("1) 일반 사업성(원가+이윤) — 공급기준")
-    g_supply_m2 = st.number_input("공급면적 합계(㎡)", value=45000.0, step=100.0, key="g_supply_m2")
-    g_land = st.number_input("택지비(총, 원)", value=350_000_000_000.0, step=1_000_000.0, format="%.0f", key="g_land")
-    g_const = st.number_input("건축비(총, 원)", value=176_000_000_000.0, step=1_000_000.0, format="%.0f", key="g_const")
-    g_add = st.number_input("가산비(총, 원)", value=20_000_000_000.0, step=1_000_000.0, format="%.0f", key="g_add")
-    g_design = st.number_input("설계·감리비(총, 원)", value=5_000_000_000.0, step=1_000_000.0, format="%.0f", key="g_design")
-    g_fin = st.number_input("금융비용(총, 원)", value=12_000_000_000.0, step=1_000_000.0, format="%.0f", key="g_fin")
-    g_mkt = st.number_input("분양·홍보비(총, 원)", value=4_000_000_000.0, step=1_000_000.0, format="%.0f", key="g_mkt")
-    g_oh = st.number_input("일반관리비(총, 원)", value=6_000_000_000.0, step=1_000_000.0, format="%.0f", key="g_oh")
-    g_etc = st.number_input("기타(총, 원)", value=3_000_000_000.0, step=1_000_000.0, format="%.0f", key="g_etc")
-    g_margin = st.number_input("이윤율(%)", min_value=0.0, max_value=30.0, value=8.0, step=0.5, key="g_margin")
-    g_vat = st.number_input("부가세율(%)", min_value=0.0, max_value=20.0, value=10.0, step=1.0, key="g_vat")
+left, right = st.columns([1.12, 0.88])
 
-with col2:
-    st.subheader("2) 분양가상한제(간이) — 공급기준")
-    c_supply_m2 = st.number_input("상한제 기준 공급면적 합계(㎡)", value=45000.0, step=100.0, key="c_supply_m2")
-    c_land = st.number_input("택지비(총, 원)", value=350_000_000_000.0, step=1_000_000.0, format="%.0f", key="c_land")
-    c_basic = st.number_input("기본형 건축비(총, 원)", value=176_000_000_000.0, step=1_000_000.0, format="%.0f", key="c_basic")
-    c_add = st.number_input("가산비(총, 원)", value=20_000_000_000.0, step=1_000_000.0, format="%.0f", key="c_add")
-    c_etc = st.number_input("간접비/기타(선택, 원)", value=0.0, step=1_000_000.0, format="%.0f", key="c_etc")
-    c_vat = st.number_input("상한제 부가세율(%, 선택)", min_value=0.0, max_value=20.0, value=0.0, step=1.0, key="c_vat")
-
-g_cost = g_land + g_const + g_add + g_design + g_fin + g_mkt + g_oh + g_etc
-g_profit = g_cost * (g_margin / 100.0)
-g_supply_price = g_cost + g_profit
-g_vat_amt = g_supply_price * (g_vat / 100.0)
-g_total = g_supply_price + g_vat_amt
-g_won_per_py_supply = (g_total / g_supply_m2) * M2_PER_PYEONG if g_supply_m2 > 0 else 0.0
-
-c_supply_price = c_land + c_basic + c_add + c_etc
-c_vat_amt = c_supply_price * (c_vat / 100.0)
-c_total = c_supply_price + c_vat_amt
-c_won_per_py_supply = (c_total / c_supply_m2) * M2_PER_PYEONG if c_supply_m2 > 0 else 0.0
-
-st.divider()
-st.subheader("3) 주변 시세 자동(실거래가) — 아파트 + 오피스텔")
-
-run = st.button("실거래가 자동 조회 / 재계산", type="primary", key="run_btn")
-
-market_avg_exclu = 0.0
-market_price_supply = 0.0
-market_count = 0
-
-if run:
-    if not service_key:
-        st.error("SERVICE_KEY가 비어 있습니다. 배포 후 Secrets에 설정해주세요.")
-    else:
-        yms = ym_backwards(end_ym, int(months))
-        dfs = []
-        with st.spinner("실거래가 조회 중... (월별 호출 후 합산)"):
-            if "아파트" in assets:
-                for ym in yms:
-                    df = get_apartment_trades(cfg, lawd_cd, ym)
-                    if not df.empty:
-                        dfs.append(df)
-            if "오피스텔" in assets:
-                for ym in yms:
-                    df = get_officetel_trades(cfg, lawd_cd, ym)
-                    if not df.empty:
-                        dfs.append(df)
-
-        merged = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
-        if merged.empty:
-            st.warning("조회된 실거래가가 없습니다. (지역/기간/면적대/키워드를 확인해주세요)")
+with left:
+    st.subheader("대상지 지도")
+    geo = geocode_address(target_addr) if target_addr.strip() else None
+    if target_addr.strip() and not geo:
+        st.info("주소를 찾지 못했습니다. (예: '서울 강서구 염창동 244-3' 처럼 구체적으로 입력해보세요.)")
+    if geo:
+        url = static_map_url(geo["lat"], geo["lon"], zoom=13, w=900, h=420)
+        img = download_image(url)
+        if img:
+            st.image(img, use_container_width=True)
         else:
-            filtered = hogang_style_filter(merged, float(target_m2), float(tol_m2), keyword, int(recent_n))
-            market_count = len(filtered)
-            if market_count > 0:
-                market_avg_exclu = float(filtered["평당가(원/평,전용)"].mean())
-                market_price_supply = market_avg_exclu * float(exclusive_ratio) * float(alpha) * float(beta)
-                st.success(
-                    f"집계 {market_count}건 · "
-                    f"평당 평균(전용) {fmt0(market_avg_exclu)}원/평 · "
-                    f"시세기반 분양가(공급) {fmt0(market_price_supply)}원/평"
-                )
+            st.map(pd.DataFrame([{"lat": geo["lat"], "lon": geo["lon"]}]), zoom=13)
+        st.caption(f"좌표: {geo['lat']:.6f}, {geo['lon']:.6f}")
+    else:
+        st.caption("주소를 입력하면 지도에 표시됩니다.")
+
+    st.divider()
+    st.subheader("주변 시세(매매 실거래) 자동")
+    run = st.button("실거래 조회 / 재계산", type="primary", key="btn_run")
+
+    if "filtered_df" not in st.session_state:
+        st.session_state["filtered_df"] = pd.DataFrame()
+    if "market_base_supply" not in st.session_state:
+        st.session_state["market_base_supply"] = 0.0
+
+    if run:
+        if not service_key:
+            st.error("SERVICE_KEY가 비어 있어 실거래 조회를 할 수 없습니다. (Streamlit Cloud → Secrets)")
+        else:
+            yms = ym_backwards(end_ym, int(months))
+            dfs = []
+            with st.spinner("실거래가 조회 중... (월별 호출 후 합산)"):
+                for ym in yms:
+                    df = get_apartment_trades(cfg, lawd_cd, ym) if product == "아파트" else get_officetel_trades(cfg, lawd_cd, ym)
+                    if not df.empty:
+                        dfs.append(df)
+            merged = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+            if merged.empty:
+                st.warning("조회된 실거래가가 없습니다. (지역/기간/면적대/키워드를 확인해주세요)")
             else:
-                st.warning("필터(면적대/키워드/최근N건) 적용 후 데이터가 없습니다.")
+                flt = hogang_style_filter(merged, float(target_m2), float(tol_m2), keyword, int(recent_n))
+                st.session_state["filtered_df"] = flt
+                if len(flt) > 0:
+                    base_supply = float(flt["평당가(원/평,전용)"].mean()) * float(exclusive_ratio)
+                    st.session_state["market_base_supply"] = float(base_supply)
+                    st.success(f"{product} 실거래 {len(flt)}건 · 공급환산(매매 베이스) {fmt0(base_supply)}")
+                else:
+                    st.warning("필터 적용 후 데이터가 없습니다.")
 
-            st.dataframe(
-                filtered.sort_values("거래일자", ascending=False).head(50),
-                use_container_width=True,
-                hide_index=True
+    flt_show = st.session_state.get("filtered_df", pd.DataFrame())
+    if isinstance(flt_show, pd.DataFrame) and not flt_show.empty:
+        st.dataframe(flt_show.sort_values("거래일자", ascending=False).head(80), use_container_width=True, hide_index=True)
+
+with right:
+    st.subheader("입지/브랜드 가중치")
+    loc_grade = st.selectbox("입지 등급(프리셋)", list(LOCATION_PRESETS.keys()), index=2, key="loc_grade")
+    loc_base = LOCATION_PRESETS[loc_grade]
+    subway_min = st.number_input("주요역 도보(분)", min_value=0, max_value=40, value=12, step=1, key="loc_sub")
+    school_min = st.number_input("학군/학교 도보(분)", min_value=0, max_value=40, value=10, step=1, key="loc_sch")
+    infra_min = st.number_input("상권/생활 도보(분)", min_value=0, max_value=40, value=8, step=1, key="loc_inf")
+    dev = st.selectbox("개발호재/직주", ["없음", "보통", "강함"], index=1, key="loc_dev")
+    with st.expander("입지 요소별 중요도(가중치)"):
+        w_sub = st.slider("역 접근성", 0.0, 1.0, 0.35, 0.05, key="w_sub")
+        w_sch = st.slider("학군/교육", 0.0, 1.0, 0.25, 0.05, key="w_sch")
+        w_inf = st.slider("상권/생활", 0.0, 1.0, 0.25, 0.05, key="w_inf")
+        w_dev = st.slider("호재/직주", 0.0, 1.0, 0.15, 0.05, key="w_dev")
+    loc_mult = build_location_multiplier(loc_base, int(subway_min), int(school_min), int(infra_min), dev,
+                                         float(w_sub), float(w_sch), float(w_inf), float(w_dev))
+
+    brand_grade = st.selectbox("브랜드 등급(프리셋)", list(BRAND_PRESETS.keys()), index=2, key="brand_grade")
+    brand_default = BRAND_PRESETS[brand_grade]
+    brand_mult = float(st.slider("브랜드 가중치(조정)", 0.90, 1.12, float(brand_default), 0.01, key="brand_mult"))
+
+    st.divider()
+    base_supply = float(st.session_state.get("market_base_supply", 0.0))
+    final_supply = base_supply * float(loc_mult) * float(brand_mult) if base_supply > 0 else 0.0
+    st.metric("산정 분양가(공급)", "-" if final_supply <= 0 else f"{fmt0(final_supply)} 원/평")
+
+    st.divider()
+    st.subheader("보고서(PDF) 생성")
+    topn = st.number_input("비교단지 표 Top N", min_value=5, max_value=30, value=10, step=1, key="topn")
+    make_pdf = st.button("보고서 생성", key="btn_pdf")
+
+    if "pdf_bytes" not in st.session_state:
+        st.session_state["pdf_bytes"] = b""
+
+    if make_pdf:
+        flt = st.session_state.get("filtered_df", pd.DataFrame())
+        if not isinstance(flt, pd.DataFrame) or flt.empty:
+            st.error("실거래 조회 결과가 없습니다. 먼저 ‘실거래 조회 / 재계산’을 눌러주세요.")
+        else:
+            comp = build_comp_table(flt, float(exclusive_ratio), int(topn))
+            chart_png = make_bar_chart_monthly_counts(flt)
+
+            map_png = None
+            if geo:
+                markers = [(geo["lat"], geo["lon"], "red")]
+                for i, name in enumerate(comp["단지명"].head(5).tolist()):
+                    g2 = geocode_address(f"{name} {lawd_label}")
+                    if g2:
+                        color = ["blue", "green", "orange", "purple", "blue"][i % 5]
+                        markers.append((g2["lat"], g2["lon"], color))
+                url = static_map_url(geo["lat"], geo["lon"], zoom=13, w=1100, h=620, markers=markers)
+                map_png = download_image(url)
+
+            params_summary = {
+                "사업명/메모": target_name or "-",
+                "대상지 주소": target_addr or "-",
+                "상품": product,
+                "지역": lawd_label,
+                "기간(개월)": int(months),
+                "면적대(전용±)": f"{target_m2}±{tol_m2}㎡",
+                "단지 키워드": keyword or "-",
+                "최근N": int(recent_n),
+                "전용률": float(exclusive_ratio),
+                "입지 등급": loc_grade,
+                "역/학군/상권/호재": f"{subway_min}/{school_min}/{infra_min}분, {dev}",
+                "브랜드 등급": brand_grade,
+            }
+
+            pdf = build_pdf_report(
+                title=f"{report_title} - {target_name}".strip(" -"),
+                target_addr=target_addr,
+                geo=geo,
+                product=product,
+                lawd_label=lawd_label,
+                params_summary=params_summary,
+                comp_table=comp,
+                market_base_supply=base_supply,
+                loc_mult=loc_mult,
+                brand_mult=brand_mult,
+                final_supply=final_supply,
+                map_png=map_png,
+                chart_png=chart_png,
             )
+            st.session_state["pdf_bytes"] = pdf
+            st.success("보고서 생성 완료! 아래에서 다운로드하세요.")
 
-st.divider()
-st.subheader("요약 비교 (공급기준)")
-
-k1, k2, k3, k4 = st.columns(4)
-k1.metric("일반 사업성(공급)", f"{fmt0(g_won_per_py_supply)} 원/평")
-k2.metric("상한제(공급)", f"{fmt0(c_won_per_py_supply)} 원/평")
-k3.metric("시세기반 분양가(공급)", "-" if market_price_supply <= 0 else f"{fmt0(market_price_supply)} 원/평")
-
-rec_supply = min(
-    c_won_per_py_supply if c_won_per_py_supply > 0 else math.inf,
-    market_price_supply if market_price_supply > 0 else math.inf
-)
-k4.metric(
-    "권장 분양가(공급, 예시)",
-    "-" if rec_supply == math.inf else f"{fmt0(rec_supply)} 원/평",
-    help="예시 로직: MIN(상한제(공급), 시세기반(공급))"
-)
-
-st.caption(
-    "※ 시세기반(공급) = 실거래 평당(전용) × 전용률(전용/공급) × α × β. "
-    "API는 월(YYYYMM) 단위라 ‘최근 N개월’은 월별 호출을 합산합니다."
-)
+    if st.session_state.get("pdf_bytes"):
+        st.download_button("PDF 다운로드", data=st.session_state["pdf_bytes"],
+                           file_name=f"시장조사_보고서_{dt.date.today().strftime('%Y%m%d')}.pdf",
+                           mime="application/pdf", key="dl_pdf")
