@@ -829,7 +829,7 @@ else:
         st.session_state["market_base_supply"] = 0.0
 
 # 필터로 0건이면, 기간을 더 늘려 한 번 더 시도
-                if flt.empty and int(months) < 60:
+if flt.empty and int(months) < 60:
                     st.info("면적/키워드 필터로 0건이라, 기간을 60개월로 확장해 한 번 더 시도합니다.")
                     merged2 = fetch_range(60)
                     if not merged2.empty:
