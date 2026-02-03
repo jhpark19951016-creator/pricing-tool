@@ -47,3 +47,7 @@ SERVICE_KEY = "공공데이터포털 디코딩 서비스키"
 - 상품 옵션에 **아파트+오피스텔** 추가(동시 조회/집계)
 - 지도에 **비교단지 마커 자동 표시**(아파트=파랑, 오피스텔=초록)
 - 보고서 비교단지 표에 자산(아파트/오피스텔) 컬럼 추가
+
+
+## v6.4.1 핫픽스
+- Streamlit DuplicateElementKey 오류 해결: selectbox key 중복 제거(s_product → s_product_2)
