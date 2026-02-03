@@ -135,7 +135,7 @@ def fetch_rtms_items(base_url: str, params: Dict[str, str], cfg: RtmsConfig) -> 
 
 @st.cache_data(ttl=900, show_spinner=False)
 def get_apartment_trades(cfg: RtmsConfig, lawd_cd: str, deal_ym: str) -> pd.DataFrame:
-    base_url = "https://apis.data.go.kr/1613000/RTMSDataSvcAptTradeDev/getRTMSDataSvcAptTradeDev"
+    base_url = "https://apis.data.go.kr/1613000/RTMSDataSvcAptTrade/getRTMSDataSvcAptTrade"
     params = {"serviceKey": cfg.service_key, "LAWD_CD": lawd_cd, "DEAL_YMD": deal_ym, "numOfRows": "1000", "pageNo": "1"}
     items = fetch_rtms_items(base_url, params, cfg)
     rows = []
@@ -199,15 +199,31 @@ def hogang_style_filter(df: pd.DataFrame, target_m2: float, tol_m2: float, keywo
 
 @st.cache_data(show_spinner=False)
 def load_lawd_codes() -> pd.DataFrame:
-    path = "lawd_codes.csv"
-    if os.path.exists(path):
-        df = pd.read_csv(path, dtype={"code": str})
-        df["code"] = df["code"].astype(str).str.zfill(5)
-        df["label"] = df["name"].astype(str) + " (" + df["code"] + ")"
-        return df.sort_values(["name", "code"]).reset_index(drop=True)
-    return pd.DataFrame([{"code": "11110", "name": "서울 종로구", "label": "서울 종로구 (11110)"}])
+    """Loads LAWD (시군구 5자리) codes.
+    Preference: lawd_codes.xlsx → lawd_codes.csv → built-in minimal list.
+    """
+    xlsx_path = "lawd_codes.xlsx"
+    csv_path = "lawd_codes.csv"
 
+    df = None
+    try:
+        if os.path.exists(xlsx_path):
+            df = pd.read_excel(xlsx_path, dtype={"code": str})
+        elif os.path.exists(csv_path):
+            df = pd.read_csv(csv_path, dtype={"code": str})
+    except Exception:
+        df = None
 
+    if df is None or df.empty:
+        df = pd.DataFrame([{"code": "11110", "name": "서울 종로구"}])
+
+    if "code" not in df.columns or "name" not in df.columns:
+        df = pd.DataFrame([{"code": "11110", "name": "서울 종로구"}])
+
+    df["code"] = df["code"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(5)
+    df["name"] = df["name"].astype(str)
+    df["label"] = df["name"] + " (" + df["code"] + ")"
+    return df.sort_values(["name", "code"]).reset_index(drop=True)
 @st.cache_data(ttl=86400, show_spinner=False)
 def geocode_address(addr: str) -> Optional[Dict[str, float]]:
     if not addr.strip():
@@ -482,6 +498,7 @@ with left:
 
     st.divider()
     st.subheader("주변 시세(매매 실거래) 자동")
+    st.caption("아파트/오피스텔 모두 ‘운영(일반) 실거래 API’ 엔드포인트로 조회합니다.")
     run = st.button("실거래 조회 / 재계산", type="primary", key="btn_run")
 
     if "filtered_df" not in st.session_state:
