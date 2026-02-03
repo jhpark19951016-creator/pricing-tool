@@ -331,6 +331,29 @@ INCHEON_GU = {
     "Seo-gu": "서구",
 }
 
+def geocode_complex_name(name: str, lawd_label: str) -> Optional[Dict[str, float]]:
+    """단지명 + (선택)행정구역 라벨로 Nominatim 지오코딩(베스트에포트).
+    - lawd_label 예: '서울특별시 중구'
+    - name 예: 'e편한세상 염창'
+    반환: {'lat': float, 'lon': float} 또는 None
+    """
+    if not name:
+        return None
+    nm = str(name).strip()
+
+    # 검색 품질을 위해 불필요한 접미어 제거
+    nm = re.sub(r"\b(아파트|APT|주상복합|오피스텔|오피스텔\(\)|주거용)\b", "", nm, flags=re.IGNORECASE).strip()
+
+    # 1차: 지역 + 단지명
+    if lawd_label:
+        q1 = f"{lawd_label} {nm}".strip()
+        g = geocode_address(q1)
+        if g:
+            return g
+
+    # 2차: 단지명만
+    return geocode_address(nm)
+
 def _guess_korean_admin(address: dict) -> Tuple[Optional[str], Optional[str]]:
     """Return (metro_ko, district_ko) best-effort from Nominatim reverse address."""
     if not address:
