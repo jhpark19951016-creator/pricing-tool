@@ -11,6 +11,9 @@ import streamlit as st
 import xmltodict
 
 import matplotlib.pyplot as plt
+
+import folium
+from streamlit_folium import st_folium
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.lib import colors
@@ -243,6 +246,128 @@ def geocode_address(addr: str) -> Optional[Dict[str, float]]:
         return None
 
 
+
+EN_TO_KO_METRO = {
+    "Seoul": "서울",
+    "Incheon": "인천",
+    "Suwon-si": "경기 수원시",
+    "Seongnam-si": "경기 성남시",
+    "Chungju-si": "충북 충주시",
+    "Gyeonggi-do": "경기",
+    "Chungcheongbuk-do": "충북",
+}
+
+# Minimal district translations (expand as needed)
+SEOUL_GU = {
+    "Jongno-gu": "종로구",
+    "Jung-gu": "중구",
+    "Yongsan-gu": "용산구",
+    "Seongdong-gu": "성동구",
+    "Gwangjin-gu": "광진구",
+    "Gangseo-gu": "강서구",
+    "Gangnam-gu": "강남구",
+    "Songpa-gu": "송파구",
+}
+
+INCHEON_GU = {
+    "Namdong-gu": "남동구",
+    "Bupyeong-gu": "부평구",
+    "Gyeyang-gu": "계양구",
+    "Seo-gu": "서구",
+}
+
+def _guess_korean_admin(address: dict) -> Tuple[Optional[str], Optional[str]]:
+    """Return (metro_ko, district_ko) best-effort from Nominatim reverse address."""
+    if not address:
+        return None, None
+
+    # metro candidates
+    metro = address.get("city") or address.get("state") or address.get("region") or address.get("province")
+    if isinstance(metro, str):
+        metro = metro.strip()
+
+    # district candidates
+    dist = address.get("borough") or address.get("city_district") or address.get("county") or address.get("municipality")
+    if isinstance(dist, str):
+        dist = dist.strip()
+
+    # Convert metro
+    metro_ko = None
+    if metro:
+        if "서울" in metro: metro_ko = "서울"
+        elif "인천" in metro: metro_ko = "인천"
+        elif "경기" in metro: metro_ko = "경기"
+        elif "충북" in metro or "충청북도" in metro: metro_ko = "충북"
+        elif metro in EN_TO_KO_METRO: metro_ko = EN_TO_KO_METRO[metro]
+        elif metro == "Seoul": metro_ko = "서울"
+        elif metro == "Incheon": metro_ko = "인천"
+
+    # Convert district (gu level)
+    dist_ko = None
+    if dist:
+        # already Korean with '구'
+        if "구" in dist:
+            dist_ko = dist.split()[0]
+        else:
+            if dist in SEOUL_GU:
+                dist_ko = SEOUL_GU[dist]
+                metro_ko = metro_ko or "서울"
+            elif dist in INCHEON_GU:
+                dist_ko = INCHEON_GU[dist]
+                metro_ko = metro_ko or "인천"
+            elif dist.endswith("-gu"):
+                # fallback: strip and add '구' (not always correct but helps)
+                base = dist.replace("-gu", "")
+                dist_ko = base + "구"
+
+    return metro_ko, dist_ko
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def reverse_geocode(lat: float, lon: float) -> Optional[Dict[str, Any]]:
+    url = "https://nominatim.openstreetmap.org/reverse"
+    params = {"lat": lat, "lon": lon, "format": "jsonv2", "zoom": 18, "addressdetails": 1}
+    headers = {"User-Agent": "pricing-tool/1.0 (streamlit)"}
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=15)
+        if r.status_code != 200:
+            return None
+        return r.json()
+    except Exception:
+        return None
+
+
+def infer_lawd_from_latlon(lawd_df: pd.DataFrame, lat: float, lon: float) -> Tuple[Optional[str], str]:
+    """Return (lawd_cd, label) by reverse geocoding + matching lawd_codes list."""
+    data = reverse_geocode(lat, lon)
+    if not data:
+        return None, "역지오코딩 실패"
+    addr = data.get("address", {}) or {}
+    metro_ko, dist_ko = _guess_korean_admin(addr)
+
+    # Compose candidates like '서울 강서구' or '인천 서구'
+    candidates = []
+    if metro_ko and dist_ko:
+        candidates.append(f"{metro_ko} {dist_ko}")
+    if dist_ko:
+        candidates.append(dist_ko)
+
+    # Try match
+    for c in candidates:
+        hit = lawd_df[lawd_df["name"].astype(str).str.contains(c, na=False)]
+        if not hit.empty:
+            row = hit.iloc[0]
+            return str(row["code"]), str(row["label"])
+    # As a fallback, try substring match from display_name (Korean often included)
+    disp = str(data.get("display_name", ""))
+    for _, row in lawd_df.iterrows():
+        name = str(row["name"])
+        if name and name in disp:
+            return str(row["code"]), str(row["label"])
+
+    return None, "시군구 매칭 실패(수동 선택 필요)"
+
+
 def static_map_url(lat: float, lon: float, zoom: int = 13, w: int = 1100, h: int = 620, markers: Optional[List[Tuple[float,float,str]]] = None) -> str:
     base = "https://staticmap.openstreetmap.de/staticmap.php"
     parts = [f"center={lat},{lon}", f"zoom={zoom}", f"size={w}x{h}", "maptype=mapnik"]
@@ -324,13 +449,14 @@ def register_korean_font():
 def build_comp_table(filtered: pd.DataFrame, exclusive_ratio: float, topn: int = 10) -> pd.DataFrame:
     if filtered.empty:
         return pd.DataFrame()
-    g = filtered.groupby("단지명").agg(건수=("단지명", "size"), 평당가_전용=("평당가(원/평,전용)", "mean")).reset_index()
+    work = filtered.copy()
+    if "자산" not in work.columns:
+        work["자산"] = "기타"
+    g = work.groupby(["자산", "단지명"]).agg(건수=("단지명", "size"), 평당가_전용=("평당가(원/평,전용)", "mean")).reset_index()
     g = g.sort_values(["건수", "평당가_전용"], ascending=[False, False]).head(topn)
     g["공급환산(전용→공급)"] = g["평당가_전용"] * float(exclusive_ratio)
     g = g.rename(columns={"평당가_전용": "평당가(전용)"})
     return g
-
-
 def build_pdf_report(title: str, target_addr: str, geo: Optional[Dict[str, float]], product: str, lawd_label: str,
                      params_summary: Dict[str, Any], comp_table: pd.DataFrame, market_base_supply: float,
                      loc_mult: float, brand_mult: float, final_supply: float, map_png: Optional[bytes], chart_png: Optional[bytes]) -> bytes:
@@ -385,11 +511,11 @@ def build_pdf_report(title: str, target_addr: str, geo: Optional[Dict[str, float
 
     story.append(Paragraph("4. 인근 시세 현황 (비교 단지)", H2))
     if comp_table is not None and not comp_table.empty:
-        cols = ["단지명", "건수", "평당가(전용)", "공급환산(전용→공급)"]
+        cols = ["자산", "단지명", "건수", "평당가(전용)", "공급환산(전용→공급)"]
         data = [cols]
         for _, r in comp_table.iterrows():
-            data.append([str(r["단지명"]), str(int(r["건수"])), f"{fmt0(float(r['평당가(전용)']))}", f"{fmt0(float(r['공급환산(전용→공급)']))}"])
-        tbl = Table(data, colWidths=[70*mm, 15*mm, 40*mm, 45*mm])
+            data.append([str(r.get("자산","-")), str(r["단지명"]), str(int(r["건수"])), f"{fmt0(float(r['평당가(전용)']))}", f"{fmt0(float(r['공급환산(전용→공급)']))}"])
+        tbl = Table(data, colWidths=[18*mm, 62*mm, 15*mm, 40*mm, 45*mm])
         tbl.setStyle(TableStyle([
             ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#1f4e79")),
             ("TEXTCOLOR", (0,0), (-1,0), colors.white),
@@ -450,20 +576,17 @@ with st.sidebar:
     target_addr = st.text_input("대상지 주소(지도)", value="", key="t_addr")
 
     st.divider()
-    st.subheader("상품/지역/기간")
-    q = st.text_input("지역 검색(선택)", value="", key="s_search")
-    view = lawd_df
-    if q.strip():
-        qq = q.strip().lower()
-        view = view[view["label"].fillna("").str.lower().str.contains(qq)]
-        if view.empty:
-            st.info("검색 결과가 없습니다. lawd_codes.csv에 지역을 추가하세요.")
-            view = lawd_df
-    sel = st.selectbox("법정동코드(시군구 5자리)", view["label"].tolist(), index=0, key="s_lawd")
-    lawd_cd = view[view["label"] == sel]["code"].iloc[0]
-    lawd_label = sel
+    st.subheader("상품/기간")
+    product = st.selectbox("상품", ["아파트", "오피스텔", "아파트+오피스텔"], index=0, key="s_product")
+    end_ym = st.text_input("기준 계약년월(YYYYMM)", value=dt.date.today().strftime("%Y%m"), key="s_endym")
+    months = st.number_input("최근 기간(개월)", min_value=1, max_value=36, value=12, step=1, key="s_months")
 
-    product = st.selectbox("상품", ["아파트", "오피스텔"], index=0, key="s_product")
+    st.divider()
+    st.subheader("지도 기반 위치 선택")
+    st.caption("지도를 클릭해 핀 위치를 바꾸면, 해당 위치의 시군구(법정동코드 5자리)를 자동 추정합니다.")
+
+
+    product = st.selectbox("상품", ["아파트", "오피스텔", "아파트+오피스텔"], index=0, key="s_product")
     end_ym = st.text_input("기준 계약년월(YYYYMM)", value=dt.date.today().strftime("%Y%m"), key="s_endym")
     months = st.number_input("최근 기간(개월)", min_value=1, max_value=36, value=12, step=1, key="s_months")
 
@@ -481,23 +604,88 @@ with st.sidebar:
 left, right = st.columns([1.12, 0.88])
 
 with left:
-    st.subheader("대상지 지도")
-    geo = geocode_address(target_addr) if target_addr.strip() else None
-    if target_addr.strip() and not geo:
-        st.info("주소를 찾지 못했습니다. (예: '서울 강서구 염창동 244-3' 처럼 구체적으로 입력해보세요.)")
-    if geo:
-        url = static_map_url(geo["lat"], geo["lon"], zoom=13, w=900, h=420)
-        img = download_image(url)
-        if img:
-            st.image(img, use_container_width=True)
+    st.subheader("대상지 지도 (클릭으로 핀 이동)")
+
+    # 초기 위치(서울 시청)
+    if "pin_lat" not in st.session_state:
+        st.session_state["pin_lat"] = 37.5665
+    if "pin_lon" not in st.session_state:
+        st.session_state["pin_lon"] = 126.9780
+
+    # 주소 입력은 선택(원하면 주소 → 좌표로 이동)
+    if target_addr.strip():
+        geo = geocode_address(target_addr)
+        if geo:
+            st.session_state["pin_lat"] = geo["lat"]
+            st.session_state["pin_lon"] = geo["lon"]
         else:
-            st.map(pd.DataFrame([{"lat": geo["lat"], "lon": geo["lon"]}]), zoom=13)
-        st.caption(f"좌표: {geo['lat']:.6f}, {geo['lon']:.6f}")
+            st.info("주소를 찾지 못했습니다. 지도에서 직접 위치를 클릭해 주세요.")
+    geo = {"lat": float(st.session_state["pin_lat"]), "lon": float(st.session_state["pin_lon"])}
+
+    # Folium map (click to move pin)
+    m = folium.Map(location=[geo["lat"], geo["lon"]], zoom_start=14, control_scale=True)
+    folium.Marker([geo["lat"], geo["lon"]], tooltip="대상지(클릭 위치)", icon=folium.Icon(color="red")).add_to(m)
+
+    # 비교 단지 마커(자동): 실거래 조회 후 비교단지 표 기반으로 지도에 표시
+    @st.cache_data(ttl=86400, show_spinner=False)
+    def geocode_complex_name(name: str, lawd_label: str) -> Optional[Dict[str, float]]:
+        q = f"{name} {lawd_label}"
+        return geocode_address(q)  # reuse search geocoder (best-effort)
+
+    show_comp_markers = st.checkbox("비교단지 마커 표시", value=True, key="show_comp_markers")
+
+    if show_comp_markers:
+        flt_tmp = st.session_state.get("filtered_df", pd.DataFrame())
+        if isinstance(flt_tmp, pd.DataFrame) and not flt_tmp.empty:
+            comp_tmp = build_comp_table(flt_tmp, float(exclusive_ratio), topn=10)
+            # Add up to 10 markers
+            for _, row in comp_tmp.iterrows():
+                nm = str(row.get("단지명","")).strip()
+                asset = str(row.get("자산",""))
+                if not nm:
+                    continue
+                g2 = geocode_complex_name(nm, lawd_label)
+                if not g2:
+                    continue
+                color = "blue" if asset == "아파트" else ("green" if asset == "오피스텔" else "gray")
+                tip = f"{asset} | {nm} | 공급환산 {fmt0(float(row.get('공급환산(전용→공급)',0)))}"
+                folium.Marker([g2["lat"], g2["lon"]], tooltip=tip, icon=folium.Icon(color=color)).add_to(m)
+
+    out = st_folium(m, height=420, use_container_width=True)
+
+    # Update pin on click
+    if out and out.get("last_clicked"):
+        st.session_state["pin_lat"] = float(out["last_clicked"]["lat"])
+        st.session_state["pin_lon"] = float(out["last_clicked"]["lng"])
+        geo = {"lat": float(st.session_state["pin_lat"]), "lon": float(st.session_state["pin_lon"])}
+
+    st.caption(f"핀 좌표: {geo['lat']:.6f}, {geo['lon']:.6f}")
+
+    # Infer lawd code from pin
+    inferred_cd, inferred_label = infer_lawd_from_latlon(lawd_df, geo["lat"], geo["lon"])
+    if inferred_cd:
+        st.success(f"자동 추정 시군구: {inferred_label}")
+        lawd_cd = inferred_cd
+        lawd_label = inferred_label
     else:
-        st.caption("주소를 입력하면 지도에 표시됩니다.")
+        st.warning(f"시군구 자동 추정 실패: {inferred_label}")
+        # Fallback manual selection
+        q2 = st.text_input("지역 검색(수동)", value="", key="fallback_search")
+        view = lawd_df
+        if q2.strip():
+            qq = q2.strip().lower()
+            view = view[view["label"].fillna("").str.lower().str.contains(qq)]
+            if view.empty:
+                st.info("검색 결과가 없습니다. lawd_codes.xlsx에 지역을 추가하세요.")
+                view = lawd_df
+        sel = st.selectbox("시군구 선택(수동)", view["label"].tolist(), index=0, key="fallback_lawd")
+        lawd_cd = view[view["label"] == sel]["code"].iloc[0]
+        lawd_label = sel
 
     st.divider()
     st.subheader("주변 시세(매매 실거래) 자동")
+    st.caption("아파트/오피스텔 모두 ‘운영(일반) 실거래 API’ 엔드포인트로 조회합니다.")
+
     st.caption("아파트/오피스텔 모두 ‘운영(일반) 실거래 API’ 엔드포인트로 조회합니다.")
     run = st.button("실거래 조회 / 재계산", type="primary", key="btn_run")
 
@@ -514,7 +702,14 @@ with left:
             dfs = []
             with st.spinner("실거래가 조회 중... (월별 호출 후 합산)"):
                 for ym in yms:
-                    df = get_apartment_trades(cfg, lawd_cd, ym) if product == "아파트" else get_officetel_trades(cfg, lawd_cd, ym)
+                    if product == "아파트":
+                        df = get_apartment_trades(cfg, lawd_cd, ym)
+                    elif product == "오피스텔":
+                        df = get_officetel_trades(cfg, lawd_cd, ym)
+                    else:
+                        dfa = get_apartment_trades(cfg, lawd_cd, ym)
+                        dfo = get_officetel_trades(cfg, lawd_cd, ym)
+                        df = pd.concat([dfa, dfo], ignore_index=True) if (not dfa.empty or not dfo.empty) else pd.DataFrame()
                     if not df.empty:
                         dfs.append(df)
             merged = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
@@ -526,7 +721,8 @@ with left:
                 if len(flt) > 0:
                     base_supply = float(flt["평당가(원/평,전용)"].mean()) * float(exclusive_ratio)
                     st.session_state["market_base_supply"] = float(base_supply)
-                    st.success(f"{product} 실거래 {len(flt)}건 · 공급환산(매매 베이스) {fmt0(base_supply)}")
+                    types = ", ".join(sorted(set(flt["자산"].astype(str).unique()))) if "자산" in flt.columns else str(product)
+                    st.success(f"{types} 실거래 {len(flt)}건 · 공급환산(매매 베이스) {fmt0(base_supply)}")
                 else:
                     st.warning("필터 적용 후 데이터가 없습니다.")
 
