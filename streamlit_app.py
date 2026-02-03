@@ -8,6 +8,7 @@ from typing import Dict, Any, List, Tuple, Optional
 import requests
 import pandas as pd
 import streamlit as st
+import re
 import xmltodict
 
 import matplotlib.pyplot as plt
