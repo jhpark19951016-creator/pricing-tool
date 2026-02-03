@@ -203,6 +203,11 @@ def hogang_style_filter(df: pd.DataFrame, target_m2: float, tol_m2: float, keywo
 @st.cache_data(show_spinner=False)
 def load_lawd_codes() -> pd.DataFrame:
     """Loads LAWD (시군구 5자리) codes.
+
+    Accepts either of these schemas:
+      - (code, name)
+      - (LAWD_CD, sido, sigungu)
+
     Preference: lawd_codes.xlsx → lawd_codes.csv → built-in minimal list.
     """
     xlsx_path = "lawd_codes.xlsx"
@@ -211,22 +216,45 @@ def load_lawd_codes() -> pd.DataFrame:
     df = None
     try:
         if os.path.exists(xlsx_path):
-            df = pd.read_excel(xlsx_path, dtype={"code": str})
+            df = pd.read_excel(xlsx_path, dtype=str)
         elif os.path.exists(csv_path):
-            df = pd.read_csv(csv_path, dtype={"code": str})
+            df = pd.read_csv(csv_path, dtype=str)
     except Exception:
         df = None
 
     if df is None or df.empty:
-        df = pd.DataFrame([{"code": "11110", "name": "서울 종로구"}])
+        df = pd.DataFrame([{"code": "11110", "label": "서울특별시 종로구"}])
 
-    if "code" not in df.columns or "name" not in df.columns:
-        df = pd.DataFrame([{"code": "11110", "name": "서울 종로구"}])
+    cols = set([c.lower() for c in df.columns])
 
-    df["code"] = df["code"].astype(str).str.replace(r"\D", "", regex=True).str.zfill(5)
-    df["name"] = df["name"].astype(str)
-    df["label"] = df["name"] + " (" + df["code"] + ")"
-    return df.sort_values(["name", "code"]).reset_index(drop=True)
+    # Normalize to columns: code, label
+    if "code" in cols and ("name" in cols or "label" in cols):
+        # already (code, name/label)
+        if "name" in df.columns:
+            df = df.rename(columns={"name": "label"})
+        df["code"] = df["code"].astype(str).str.zfill(5)
+        df["label"] = df["label"].astype(str)
+        out = df[["code", "label"]].dropna().drop_duplicates().sort_values("label")
+        return out.reset_index(drop=True)
+
+    if ("lawd_cd" in cols) and ("sido" in cols) and ("sigungu" in cols):
+        # (LAWD_CD, sido, sigungu)
+        rename = {}
+        for c in df.columns:
+            if c.lower() == "lawd_cd":
+                rename[c] = "code"
+            elif c.lower() == "sido":
+                rename[c] = "sido"
+            elif c.lower() == "sigungu":
+                rename[c] = "sigungu"
+        df = df.rename(columns=rename)
+        df["code"] = df["code"].astype(str).str.zfill(5)
+        df["label"] = (df["sido"].fillna("").astype(str).str.strip() + " " + df["sigungu"].fillna("").astype(str).str.strip()).str.strip()
+        out = df[["code", "label"]].dropna().drop_duplicates().sort_values("label")
+        return out.reset_index(drop=True)
+
+    # Fallback minimal
+    return pd.DataFrame([{"code": "11110", "label": "서울특별시 종로구"}])
 @st.cache_data(ttl=86400, show_spinner=False)
 def geocode_address(addr: str) -> Optional[Dict[str, float]]:
     if not addr.strip():
@@ -338,35 +366,43 @@ def reverse_geocode(lat: float, lon: float) -> Optional[Dict[str, Any]]:
 
 
 def infer_lawd_from_latlon(lawd_df: pd.DataFrame, lat: float, lon: float) -> Tuple[Optional[str], str]:
-    """Return (lawd_cd, label) by reverse geocoding + matching lawd_codes list."""
+    """Return (LAWD_CD, label) inferred from a latitude/longitude.
+
+    Uses Nominatim reverse-geocode (best-effort) and matches against our LAWD list.
+    """
+    if lawd_df is None or lawd_df.empty:
+        return None, "LAWD 목록이 비어있습니다"
+
     data = reverse_geocode(lat, lon)
     if not data:
-        return None, "역지오코딩 실패"
+        return None, "역지오코딩 실패(네트워크/차단 가능)"
+
     addr = data.get("address", {}) or {}
     metro_ko, dist_ko = _guess_korean_admin(addr)
 
-    # Compose candidates like '서울 강서구' or '인천 서구'
-    candidates = []
+    # candidates like '서울특별시 강서구' etc.
+    candidates: List[str] = []
     if metro_ko and dist_ko:
         candidates.append(f"{metro_ko} {dist_ko}")
     if dist_ko:
         candidates.append(dist_ko)
 
-    # Try match
+    labels = lawd_df["label"].astype(str)
+
     for c in candidates:
-        hit = lawd_df[lawd_df["name"].astype(str).str.contains(c, na=False)]
+        hit = lawd_df[labels.str.contains(re.escape(c), na=False)]
         if not hit.empty:
             row = hit.iloc[0]
             return str(row["code"]), str(row["label"])
-    # As a fallback, try substring match from display_name (Korean often included)
+
     disp = str(data.get("display_name", ""))
+    # fallback: look for any label substring inside display_name
     for _, row in lawd_df.iterrows():
-        name = str(row["name"])
-        if name and name in disp:
+        lab = str(row.get("label", ""))
+        if lab and lab in disp:
             return str(row["code"]), str(row["label"])
 
-    return None, "시군구 매칭 실패(수동 선택 필요)"
-
+    return None, f"시군구 자동 추정 실패: {metro_ko} {dist_ko}".strip()
 
 def static_map_url(lat: float, lon: float, zoom: int = 13, w: int = 1100, h: int = 620, markers: Optional[List[Tuple[float,float,str]]] = None) -> str:
     base = "https://staticmap.openstreetmap.de/staticmap.php"
@@ -583,10 +619,11 @@ with st.sidebar:
 
     st.divider()
     st.subheader("지도 기반 위치 선택")
-    st.caption("지도를 클릭해 핀 위치를 바꾸면, 해당 위치의 시군구(법정동코드 5자리)를 자동 추정합니다.")
+    st.caption("지도를 **클릭**하면 빨간 핀이 이동합니다. (우클릭은 브라우저 메뉴가 떠서 지원이 어렵습니다)")
 
     st.divider()
     st.subheader("면적대/필터")
+
     target_m2 = st.number_input("기준 전용면적(㎡)", min_value=10.0, max_value=300.0, value=84.0, step=1.0, key="s_m2")
     tol_m2 = st.number_input("허용오차(±㎡)", min_value=0.0, max_value=20.0, value=3.0, step=0.5, key="s_tol")
     keyword = st.text_input("단지명 키워드(선택)", value="", key="s_kw")
@@ -693,35 +730,69 @@ with left:
         if not service_key:
             st.error("SERVICE_KEY가 비어 있어 실거래 조회를 할 수 없습니다. (Streamlit Cloud → Secrets)")
         else:
-            yms = ym_backwards(end_ym, int(months))
-            dfs = []
-            with st.spinner("실거래가 조회 중... (월별 호출 후 합산)"):
+            today_ym = dt.date.today().strftime("%Y%m")
+            use_end_ym = end_ym.strip()
+            if (len(use_end_ym) != 6) or (not use_end_ym.isdigit()):
+                use_end_ym = today_ym
+                st.info(f"기준 계약년월이 올바르지 않아 오늘 기준({today_ym})으로 설정했습니다.")
+            if use_end_ym > today_ym:
+                st.info(f"미래 계약년월({use_end_ym})은 조회가 비어있을 수 있어 {today_ym}으로 조정했습니다.")
+                use_end_ym = today_ym
+
+            def fetch_range(month_count: int) -> pd.DataFrame:
+                yms = ym_backwards(use_end_ym, int(month_count))
+                dfs = []
                 for ym in yms:
                     if product == "아파트":
-                        df = get_apartment_trades(cfg, lawd_cd, ym)
+                        dfm = get_apartment_trades(cfg, lawd_cd, ym)
                     elif product == "오피스텔":
-                        df = get_officetel_trades(cfg, lawd_cd, ym)
+                        dfm = get_officetel_trades(cfg, lawd_cd, ym)
                     else:
                         dfa = get_apartment_trades(cfg, lawd_cd, ym)
                         dfo = get_officetel_trades(cfg, lawd_cd, ym)
-                        df = pd.concat([dfa, dfo], ignore_index=True) if (not dfa.empty or not dfo.empty) else pd.DataFrame()
-                    if not df.empty:
-                        dfs.append(df)
-            merged = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+                        dfm = pd.concat([dfa, dfo], ignore_index=True) if (not dfa.empty or not dfo.empty) else pd.DataFrame()
+                    if not dfm.empty:
+                        dfs.append(dfm)
+                return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+
+            with st.spinner("실거래가 조회 중... (월별 호출 후 합산)"):
+                merged = fetch_range(int(months))
+
+                # 자동 기간 확장: 선택 기간에 0건이면 최대 60개월까지 12개월씩 확장
+                if merged.empty:
+                    st.warning("선택 기간에 실거래가가 없어 자동으로 기간을 확장해 재조회합니다. (최대 60개월)")
+                    for m2 in [24, 36, 48, 60]:
+                        if m2 <= int(months):
+                            continue
+                        merged = fetch_range(m2)
+                        if not merged.empty:
+                            st.info(f"기간을 {m2}개월로 확장하여 실거래 {len(merged)}건을 찾았습니다.")
+                            break
+
             if merged.empty:
                 st.warning("조회된 실거래가가 없습니다. (지역/기간/면적대/키워드를 확인해주세요)")
             else:
                 flt = hogang_style_filter(merged, float(target_m2), float(tol_m2), keyword, int(recent_n))
+
+                # 필터로 0건이면, 기간을 더 늘려 한 번 더 시도
+                if flt.empty and int(months) < 60:
+                    st.info("면적/키워드 필터로 0건이라, 기간을 60개월로 확장해 한 번 더 시도합니다.")
+                    merged2 = fetch_range(60)
+                    if not merged2.empty:
+                        flt = hogang_style_filter(merged2, float(target_m2), float(tol_m2), keyword, int(recent_n))
+
                 st.session_state["filtered_df"] = flt
+
                 if len(flt) > 0:
                     base_supply = float(flt["평당가(원/평,전용)"].mean()) * float(exclusive_ratio)
                     st.session_state["market_base_supply"] = float(base_supply)
                     types = ", ".join(sorted(set(flt["자산"].astype(str).unique()))) if "자산" in flt.columns else str(product)
                     st.success(f"{types} 실거래 {len(flt)}건 · 공급환산(매매 베이스) {fmt0(base_supply)}")
                 else:
-                    st.warning("필터 적용 후 데이터가 없습니다.")
+                    st.warning("필터 적용 후 데이터가 없습니다. (면적대/키워드/최근 N건 설정을 완화해보세요)")
 
     flt_show = st.session_state.get("filtered_df", pd.DataFrame())
+
     if isinstance(flt_show, pd.DataFrame) and not flt_show.empty:
         st.dataframe(flt_show.sort_values("거래일자", ascending=False).head(80), use_container_width=True, hide_index=True)
 

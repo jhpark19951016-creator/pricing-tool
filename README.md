@@ -51,3 +51,11 @@ SERVICE_KEY = "공공데이터포털 디코딩 서비스키"
 
 ## v6.4.1 핫픽스
 - Streamlit DuplicateElementKey 오류 해결: selectbox key 중복 제거(s_product → s_product_2)
+
+
+## v6.4.2 핫픽스
+- text_input 기준 계약년월 key 중복(s_endym) 제거
+
+
+## v6.4.2 핫픽스
+- Streamlit DuplicateElementKey 추가 해결: s_endym, s_months key 중복 제거
