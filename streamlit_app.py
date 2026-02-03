@@ -832,7 +832,7 @@ with left:
             
 st.subheader("조회 결과")
 
-if merged.empty:
+if final_df is None or final_df.empty:
     # 표 형식으로 '없음' 표시
     st.dataframe(pd.DataFrame([{"상태": "조회된 실거래가가 없습니다", "안내": "지역/기간/면적대/키워드를 확인해주세요"}]), use_container_width=True)
     st.session_state["filtered_df"] = pd.DataFrame()
