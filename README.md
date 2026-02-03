@@ -23,3 +23,15 @@
 2) Streamlit Cloud에서 main file = `streamlit_app.py`
 3) Secrets 설정:
 SERVICE_KEY = "공공데이터포털 디코딩 서비스키"
+
+
+## v6.1 변경
+- 아파트 실거래 조회 엔드포인트를 Dev에서 운영(일반)으로 변경: RTMSDataSvcAptTrade/getRTMSDataSvcAptTrade
+- 오피스텔은 기존 운영 엔드포인트 유지: RTMSDataSvcOffiTrade/getRTMSDataSvcOffiTrade
+
+
+## v6.2 변경(Fullset)
+- 법정동코드 파일을 CSV 대신 **XLSX** 우선 로딩(lawd_codes.xlsx)
+- CSV가 있으면 자동 fallback
+- requirements에 openpyxl 추가
+- 아파트/오피스텔 모두 운영(일반) 실거래 API 사용
