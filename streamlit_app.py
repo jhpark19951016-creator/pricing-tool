@@ -585,11 +585,6 @@ with st.sidebar:
     st.subheader("지도 기반 위치 선택")
     st.caption("지도를 클릭해 핀 위치를 바꾸면, 해당 위치의 시군구(법정동코드 5자리)를 자동 추정합니다.")
 
-
-    product = st.selectbox("상품", ["아파트", "오피스텔", "아파트+오피스텔"], index=0, key="s_product_2")
-    end_ym = st.text_input("기준 계약년월(YYYYMM)", value=dt.date.today().strftime("%Y%m"), key="s_endym")
-    months = st.number_input("최근 기간(개월)", min_value=1, max_value=36, value=12, step=1, key="s_months")
-
     st.divider()
     st.subheader("면적대/필터")
     target_m2 = st.number_input("기준 전용면적(㎡)", min_value=10.0, max_value=300.0, value=84.0, step=1.0, key="s_m2")
