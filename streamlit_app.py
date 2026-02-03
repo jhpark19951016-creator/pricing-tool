@@ -759,6 +759,11 @@ with left:
     st.caption("아파트/오피스텔 모두 ‘운영(일반) 실거래 API’ 엔드포인트로 조회합니다.")
     run = st.button("실거래 조회 / 재계산", type="primary", key="btn_run")
 
+    if "merged_df" not in st.session_state:
+        st.session_state["merged_df"] = pd.DataFrame()
+    if "did_query" not in st.session_state:
+        st.session_state["did_query"] = False
+
     if "filtered_df" not in st.session_state:
         st.session_state["filtered_df"] = pd.DataFrame()
     if "market_base_supply" not in st.session_state:
@@ -808,39 +813,35 @@ with left:
                             break
 
             
-st.subheader("조회 결과")
+            # 결과를 세션에 저장(다른 섹션/보고서에서 재사용)
+            st.session_state["merged_df"] = merged
+            st.session_state["did_query"] = True
 
-if merged.empty:
-    # 표 형식으로 '없음' 표시
-    st.dataframe(pd.DataFrame([{"상태": "조회된 실거래가가 없습니다", "안내": "지역/기간/면적대/키워드를 확인해주세요"}]), use_container_width=True)
-    st.session_state["filtered_df"] = pd.DataFrame()
-    st.session_state["market_base_supply"] = 0.0
-else:
-    st.caption(f"원본(기간 합산) {len(merged):,}건")
-    st.dataframe(merged.sort_values(["거래일", "거래금액(만원)"], ascending=[False, False]).head(300), use_container_width=True)
+            st.subheader("조회 결과")
 
-    flt = hogang_style_filter(merged, float(target_m2), float(tol_m2), keyword, int(recent_n))
-    st.caption(f"필터 적용 {len(flt):,}건 (전용 {target_m2}±{tol_m2}㎡, 키워드/최근N 적용)")
+            if merged.empty:
+                st.dataframe(pd.DataFrame([{"상태": "조회된 실거래가가 없습니다", "안내": "지역/기간/면적대/키워드를 확인해주세요"}]), use_container_width=True)
+                st.session_state["filtered_df"] = pd.DataFrame()
+                st.session_state["market_base_supply"] = 0.0
+            else:
+                st.caption(f"원본(기간 합산) {len(merged):,}건")
+                st.dataframe(merged.sort_values(["거래일", "거래금액(만원)"], ascending=[False, False]).head(300), use_container_width=True)
 
-    if flt.empty:
-        st.dataframe(pd.DataFrame([{"상태": "필터 조건에서 거래가 없습니다", "안내": "허용오차를 늘리거나 키워드를 비우고 다시 조회해보세요"}]), use_container_width=True)
-    else:
-        st.dataframe(flt.sort_values(["거래일", "거래금액(만원)"], ascending=[False, False]).head(300), use_container_width=True)
+                flt = hogang_style_filter(merged, float(target_m2), float(tol_m2), keyword, int(recent_n))
+                st.caption(f"필터 적용 {len(flt):,}건 (전용 {target_m2}±{tol_m2}㎡, 키워드/최근N 적용)")
 
-    # 세션 저장(지도 마커/보고서에서 재사용)
-    st.session_state["filtered_df"] = flt
-
-    # 시장 기준(공급환산) 계산용
-    try:
-        comp_tbl = build_comp_table(flt, float(exclusive_ratio), topn=200)
-        st.session_state["market_base_supply"] = float(comp_tbl["공급환산(전용→공급)"].mean()) if not comp_tbl.empty else 0.0
-    except Exception:
-        st.session_state["market_base_supply"] = 0.0
-
-    flt_show = st.session_state.get("filtered_df", pd.DataFrame())
-
-    if isinstance(flt_show, pd.DataFrame) and not flt_show.empty:
-        st.dataframe(flt_show.sort_values("거래일자", ascending=False).head(80), use_container_width=True, hide_index=True)
+                if flt.empty:
+                    st.dataframe(pd.DataFrame([{"상태": "필터 조건에서 거래가 없습니다", "안내": "허용오차를 늘리거나 키워드를 비우고 다시 조회해보세요"}]), use_container_width=True)
+                    st.session_state["filtered_df"] = pd.DataFrame()
+                    st.session_state["market_base_supply"] = 0.0
+                else:
+                    st.dataframe(flt.sort_values(["거래일", "거래금액(만원)"], ascending=[False, False]).head(300), use_container_width=True)
+                    st.session_state["filtered_df"] = flt
+                    try:
+                        comp_tbl = build_comp_table(flt, float(exclusive_ratio), topn=200)
+                        st.session_state["market_base_supply"] = float(comp_tbl["공급환산(전용→공급)"].mean()) if not comp_tbl.empty else 0.0
+                    except Exception:
+                        st.session_state["market_base_supply"] = 0.0
 
 with right:
     st.subheader("입지/브랜드 가중치")
