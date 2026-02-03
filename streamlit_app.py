@@ -401,7 +401,7 @@ def infer_lawd_from_latlon(lawd_df: pd.DataFrame, lat: float, lon: float) -> Tup
         for mv in metro_variants:
             # label은 '서울특별시 중구' 형태가 일반적이라 둘 다 포함이면 OK
             hit = lawd_df[
-                lawd_df["label"].astype(str).str.contains(re.escape(mv), na=False)
+                lawd_df["label"].astype(str).str.contains(re.escape(metro_ko), na=False)
                 & labels.str.contains(re.escape(dist_ko), na=False)
             ]
             if not hit.empty:
