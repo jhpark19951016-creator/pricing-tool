@@ -390,7 +390,7 @@ def infer_lawd_from_latlon(lawd_df: pd.DataFrame, lat: float, lon: float) -> Tup
     labels = lawd_df["label"].astype(str)
 
     for c in candidates:
-        hit = lawd_df[labels.str.contains(re.escape(c), na=False)]
+        hit = lawd_df[lawd_df["label"].str.contains(re.escape(c), na=False)]
         if not hit.empty:
             row = hit.iloc[0]
             return str(row["code"]), str(row["label"])
