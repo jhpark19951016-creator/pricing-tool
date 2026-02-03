@@ -4,6 +4,7 @@ import time
 import datetime as dt
 from dataclasses import dataclass
 from typing import Dict, Any, List, Tuple, Optional
+import re
 
 import requests
 import pandas as pd
