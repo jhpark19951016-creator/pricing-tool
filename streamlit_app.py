@@ -426,7 +426,7 @@ def infer_lawd_from_latlon(lawd_df, lat, lon):
 
 
     Uses Nominatim reverse-geocode (best-effort) and matches against our LAWD list.
-    """
+    
     if lawd_df is None or lawd_df.empty:
         return None, "LAWD 목록이 비어있습니다"
 
