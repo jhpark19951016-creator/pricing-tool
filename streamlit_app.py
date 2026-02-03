@@ -391,42 +391,11 @@ def reverse_geocode(lat: float, lon: float) -> Optional[Dict[str, Any]]:
         return None
 
 
-def infer_lawd_from_latlon(lawd_df, lat, lon):
+def infer_lawd_from_latlon(lawd_df: pd.DataFrame, lat: float, lon: float) -> Tuple[Optional[str], str]:
+    """Return (LAWD_CD, label) inferred from a latitude/longitude.
+
+    Uses Nominatim reverse-geocode (best-effort) and matches against our LAWD list.
     """
-    좌표(lat, lon)를 기준으로
-    lawd_df 에서 가장 가까운 시군구(5자리)를 하나 선택
-    """
-
-    if lawd_df is None or lawd_df.empty:
-        return None, None
-
-    # lat/lon 컬럼 확인
-    if not {"lat", "lon"}.issubset(lawd_df.columns):
-        return None, None
-
-    # 숫자로 변환
-    df = lawd_df.copy()
-    df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
-    df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
-
-    df = df.dropna(subset=["lat", "lon"])
-    if df.empty:
-        return None, None
-
-    # 거리 계산 (단순 유클리드, 충분히 정확)
-    df["dist"] = (df["lat"] - lat) ** 2 + (df["lon"] - lon) ** 2
-
-    row = df.sort_values("dist").iloc[0]
-
-    # 실거래 API용 시군구 코드(앞 5자리)
-    lawd_cd = str(row["code"])[:5]
-    label = row["label"]
-
-    return lawd_cd, label
-
-
-    # Uses Nominatim reverse-geocode (best-effort) and matches against our LAWD list.
-    
     if lawd_df is None or lawd_df.empty:
         return None, "LAWD 목록이 비어있습니다"
 
@@ -832,23 +801,23 @@ with left:
             
 st.subheader("조회 결과")
 
-if merged is None or merged.empty:
-    st.dataframe(pd.DataFrame([{"상태":"조회된 실거래가가 없습니다", "안내":"지역/기간/면적대/키워드를 확인해주세요"}]), use_container_width=True)
+if merged.empty:
+    # 표 형식으로 '없음' 표시
+    st.dataframe(pd.DataFrame([{"상태": "조회된 실거래가가 없습니다", "안내": "지역/기간/면적대/키워드를 확인해주세요"}]), use_container_width=True)
     st.session_state["filtered_df"] = pd.DataFrame()
     st.session_state["market_base_supply"] = 0.0
 else:
     st.caption(f"원본(기간 합산) {len(merged):,}건")
-    st.dataframe(merged.sort_values(["거래일","거래금액(만원)"], ascending=[False, False]).head(300), use_container_width=True)
+    st.dataframe(merged.sort_values(["거래일", "거래금액(만원)"], ascending=[False, False]).head(300), use_container_width=True)
 
     flt = hogang_style_filter(merged, float(target_m2), float(tol_m2), keyword, int(recent_n))
     st.caption(f"필터 적용 {len(flt):,}건 (전용 {target_m2}±{tol_m2}㎡, 키워드/최근N 적용)")
 
     if flt.empty:
-        st.dataframe(pd.DataFrame([{"상태":"필터 조건에서 거래가 없습니다", "안내":"허용오차를 늘리거나 키워드를 비우고 다시 조회해보세요"}]), use_container_width=True)
+        st.dataframe(pd.DataFrame([{"상태": "필터 조건에서 거래가 없습니다", "안내": "허용오차를 늘리거나 키워드를 비우고 다시 조회해보세요"}]), use_container_width=True)
     else:
-        st.dataframe(flt.sort_values(["거래일","거래금액(만원)"], ascending=[False, False]).head(300), use_container_width=True)
+        st.dataframe(flt.sort_values(["거래일", "거래금액(만원)"], ascending=[False, False]).head(300), use_container_width=True)
 
-    
     # 세션 저장(지도 마커/보고서에서 재사용)
     st.session_state["filtered_df"] = flt
 
@@ -860,21 +829,21 @@ else:
         st.session_state["market_base_supply"] = 0.0
 
 # 필터로 0건이면, 기간을 더 늘려 한 번 더 시도
-    if flt.empty and int(months) < 60:
-        st.info("면적/키워드 필터로 0건이라, 기간을 60개월로 확장해 한 번 더 시도합니다.")
-        merged2 = fetch_range(60)
-        if not merged2.empty:
-            flt = hogang_style_filter(merged2, float(target_m2), float(tol_m2), keyword, int(recent_n))
+                if flt.empty and int(months) < 60:
+                    st.info("면적/키워드 필터로 0건이라, 기간을 60개월로 확장해 한 번 더 시도합니다.")
+                    merged2 = fetch_range(60)
+                    if not merged2.empty:
+                        flt = hogang_style_filter(merged2, float(target_m2), float(tol_m2), keyword, int(recent_n))
 
-    st.session_state["filtered_df"] = flt
+                st.session_state["filtered_df"] = flt
 
-    if len(flt) > 0:
-        base_supply = float(flt["평당가(원/평,전용)"].mean()) * float(exclusive_ratio)
-        st.session_state["market_base_supply"] = float(base_supply)
-        types = ", ".join(sorted(set(flt["자산"].astype(str).unique()))) if "자산" in flt.columns else str(product)
-        st.success(f"{types} 실거래 {len(flt)}건 · 공급환산(매매 베이스) {fmt0(base_supply)}")
-    else:
-        st.warning("필터 적용 후 데이터가 없습니다. (면적대/키워드/최근 N건 설정을 완화해보세요)")
+                if len(flt) > 0:
+                    base_supply = float(flt["평당가(원/평,전용)"].mean()) * float(exclusive_ratio)
+                    st.session_state["market_base_supply"] = float(base_supply)
+                    types = ", ".join(sorted(set(flt["자산"].astype(str).unique()))) if "자산" in flt.columns else str(product)
+                    st.success(f"{types} 실거래 {len(flt)}건 · 공급환산(매매 베이스) {fmt0(base_supply)}")
+                else:
+                    st.warning("필터 적용 후 데이터가 없습니다. (면적대/키워드/최근 N건 설정을 완화해보세요)")
 
     flt_show = st.session_state.get("filtered_df", pd.DataFrame())
 
