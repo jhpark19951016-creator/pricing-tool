@@ -412,7 +412,7 @@ def infer_lawd_from_latlon(lawd_df: pd.DataFrame, lat: float, lon: float) -> Tup
 
     addr = data.get("address", {}) or {}
     metro_ko, dist_ko = _guess_korean_admin(addr)
-    county_ko = dist_ko  # 시/군/구 별칭(변수명 통일)
+    county_ko = dist_ko  # alias (시/군/구)
 
     # candidates like '서울특별시 강서구' etc.
     candidates: List[str] = []
@@ -812,6 +812,9 @@ with left:
             with st.spinner("실거래가 조회 중... (월별 호출 후 합산)"):
                 merged = fetch_range(int(months))
 
+                # 초기 결과 저장
+                st.session_state["merged_df"] = merged
+
                 # 자동 기간 확장: 선택 기간에 0건이면 최대 60개월까지 12개월씩 확장
                 if merged.empty:
                     st.warning("선택 기간에 실거래가가 없어 자동으로 기간을 확장해 재조회합니다. (최대 60개월)")
@@ -823,25 +826,49 @@ with left:
                             st.info(f"기간을 {m2}개월로 확장하여 실거래 {len(merged)}건을 찾았습니다.")
                             break
 
+            # 실행 결과 저장(버튼 미클릭 시에도 표 표시)
+            st.session_state["merged_df"] = merged
+
             
+# --- 조회 결과 표시(최근 실행 결과를 유지) ---
+merged = st.session_state.get("merged_df", pd.DataFrame())
 st.subheader("조회 결과")
 
-if merged.empty:
+if not isinstance(merged, pd.DataFrame) or merged.empty:
     # 표 형식으로 '없음' 표시
-    st.dataframe(pd.DataFrame([{"상태": "조회된 실거래가가 없습니다", "안내": "지역/기간/면적대/키워드를 확인해주세요"}]), use_container_width=True)
+    st.dataframe(
+        pd.DataFrame([{"상태": "조회된 실거래가가 없습니다", "안내": "1) 시군구 자동추정 2) 기간(YYYYMM/개월) 3) API 엔드포인트 4) 서비스키를 확인해주세요"}]),
+        use_container_width=True,
+        hide_index=True,
+    )
     st.session_state["filtered_df"] = pd.DataFrame()
     st.session_state["market_base_supply"] = 0.0
 else:
     st.caption(f"원본(기간 합산) {len(merged):,}건")
-    st.dataframe(merged.sort_values(["거래일", "거래금액(만원)"], ascending=[False, False]).head(300), use_container_width=True)
+    # 컬럼명이 조금씩 달라도 안전하게 처리
+    sort_cols = [c for c in ["거래일", "거래일자", "거래년월일", "거래금액(만원)", "거래금액"] if c in merged.columns]
+    if sort_cols:
+        merged_show = merged.sort_values(sort_cols[:2], ascending=[False, False] if len(sort_cols) > 1 else [False])
+    else:
+        merged_show = merged
+    st.dataframe(merged_show.head(300), use_container_width=True, hide_index=True)
 
     flt = hogang_style_filter(merged, float(target_m2), float(tol_m2), keyword, int(recent_n))
     st.caption(f"필터 적용 {len(flt):,}건 (전용 {target_m2}±{tol_m2}㎡, 키워드/최근N 적용)")
 
     if flt.empty:
-        st.dataframe(pd.DataFrame([{"상태": "필터 조건에서 거래가 없습니다", "안내": "허용오차를 늘리거나 키워드를 비우고 다시 조회해보세요"}]), use_container_width=True)
+        st.dataframe(
+            pd.DataFrame([{"상태": "필터 조건에서 거래가 없습니다", "안내": "허용오차를 늘리거나 키워드를 비우고 다시 조회해보세요"}]),
+            use_container_width=True,
+            hide_index=True,
+        )
     else:
-        st.dataframe(flt.sort_values(["거래일", "거래금액(만원)"], ascending=[False, False]).head(300), use_container_width=True)
+        sort_cols2 = [c for c in ["거래일", "거래일자", "거래년월일", "거래금액(만원)", "거래금액"] if c in flt.columns]
+        if sort_cols2:
+            flt_show = flt.sort_values(sort_cols2[:2], ascending=[False, False] if len(sort_cols2) > 1 else [False])
+        else:
+            flt_show = flt
+        st.dataframe(flt_show.head(300), use_container_width=True, hide_index=True)
 
     # 세션 저장(지도 마커/보고서에서 재사용)
     st.session_state["filtered_df"] = flt
@@ -853,11 +880,14 @@ else:
     except Exception:
         st.session_state["market_base_supply"] = 0.0
 
-    flt_show = st.session_state.get("filtered_df", pd.DataFrame())
-
-    if isinstance(flt_show, pd.DataFrame) and not flt_show.empty:
-        st.dataframe(flt_show.sort_values("거래일자", ascending=False).head(80), use_container_width=True, hide_index=True)
-
+    # 필터 결과 요약(최대 80건)
+    flt_show2 = st.session_state.get("filtered_df", pd.DataFrame())
+    if isinstance(flt_show2, pd.DataFrame) and not flt_show2.empty:
+        sort_col3 = "거래일자" if "거래일자" in flt_show2.columns else ("거래일" if "거래일" in flt_show2.columns else None)
+        if sort_col3:
+            st.dataframe(flt_show2.sort_values(sort_col3, ascending=False).head(80), use_container_width=True, hide_index=True)
+        else:
+            st.dataframe(flt_show2.head(80), use_container_width=True, hide_index=True)
 with right:
     st.subheader("입지/브랜드 가중치")
     loc_grade = st.selectbox("입지 등급(프리셋)", list(LOCATION_PRESETS.keys()), index=2, key="loc_grade")
