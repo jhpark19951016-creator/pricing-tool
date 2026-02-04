@@ -412,6 +412,7 @@ def infer_lawd_from_latlon(lawd_df: pd.DataFrame, lat: float, lon: float) -> Tup
 
     addr = data.get("address", {}) or {}
     metro_ko, dist_ko = _guess_korean_admin(addr)
+    county_ko = dist_ko  # 시/군/구 별칭(변수명 통일)
 
     # candidates like '서울특별시 강서구' etc.
     candidates: List[str] = []
