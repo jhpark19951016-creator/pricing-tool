@@ -717,18 +717,25 @@ with left:
             comp_tmp = build_comp_table(flt_tmp, float(exclusive_ratio), topn=10)
             # Add up to 10 markers
             for _, row in comp_tmp.iterrows():
-                nm = str(row.get("단지명","")).strip()
-                asset = str(row.get("자산",""))
+                nm = str(row.get("단지명", "")).strip()
+                asset = str(row.get("자산", ""))
+            
                 if not nm:
                     continue
-        g2 = geocode_complex_name(nm, lawd_label) if 'geocode_complex_name' in globals() else None
+            
+                g2 = geocode_complex_name(nm, lawd_label) if 'geocode_complex_name' in globals() else None
                 if not g2:
                     continue
+            
                 color = "blue" if asset == "아파트" else ("green" if asset == "오피스텔" else "gray")
-                tip = f"{asset} | {nm} | 공급환산 {fmt0(float(row.get('공급환산(전용→공급)',0)))}"
-                folium.Marker([g2["lat"], g2["lon"]], tooltip=tip, icon=folium.Icon(color=color)).add_to(m)
+                tip = f"{asset} | {nm} | 공급면적 {fmt0(float(row.get('공급면적(전용+공용)',0)))}"
+            
+                folium.Marker(
+                    [g2["lat"], g2["lon"]],
+                    tooltip=tip,
+                    icon=folium.Icon(color=color)
+                ).add_to(m)
 
-    out = st_folium(m, height=420, use_container_width=True)
 
     # Update pin on click
     if out and out.get("last_clicked"):
