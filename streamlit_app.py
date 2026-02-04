@@ -1,5 +1,4 @@
 import os
-import re
 import io
 import time
 import datetime as dt
@@ -271,20 +270,14 @@ def load_lawd_codes() -> pd.DataFrame:
     out["code"] = out["code"].astype(str).str.strip()
     out["label"] = out["label"].astype(str).str.strip()
 
-    # 법정동코드는 보통 10자리(리/동/읍면 포함)입니다.
-    # 다만 국토부 실거래 API 파라미터 LAWD_CD는 "시군구 5자리"만 받습니다.
-    # 그래서: code(표시용)=10자리로 정규화, sigungu(API용)=앞 5자리로 따로 보관합니다.
-    digits = out["code"].astype(str).str.replace(r"\D", "", regex=True)
-    out["code_raw"] = digits
-    def _to_code10(s: str) -> str:
-        s = (s or "")
-        if len(s) == 5:
-            return s + "00000"
-        if len(s) >= 10:
-            return s[:10]
-        return s.zfill(10)
-    out["code"] = digits.apply(_to_code10)
-    out["sigungu"] = out["code"].str.slice(0, 5)
+    # 실거래 API는 시군구 5자리
+    out["sigungu"] = (
+        out["code"]
+        .str.replace(r"\D", "", regex=True)
+        .str.slice(0, 5)
+        .str.zfill(5)
+    )
+
     out = out.dropna().drop_duplicates(subset=["code", "label"]).sort_values(["label", "code"]).reset_index(drop=True)
     return out
 
@@ -412,7 +405,6 @@ def infer_lawd_from_latlon(lawd_df: pd.DataFrame, lat: float, lon: float) -> Tup
 
     addr = data.get("address", {}) or {}
     metro_ko, dist_ko = _guess_korean_admin(addr)
-    county_ko = dist_ko  # alias (시/군/구)
 
     # candidates like '서울특별시 강서구' etc.
     candidates: List[str] = []
@@ -423,31 +415,20 @@ def infer_lawd_from_latlon(lawd_df: pd.DataFrame, lat: float, lon: float) -> Tup
 
     labels = lawd_df["label"].astype(str)
 
-    # 1순위: "광역시/도 + 시군구" 정확히 일치
-    if metro_ko and county_ko:
-        full = f"{metro_ko} {county_ko}".strip()
-        hit = lawd_df[labels == full]
+    for c in candidates:
+        hit = lawd_df[labels.str.contains(re.escape(c), na=False)]
         if not hit.empty:
             row = hit.iloc[0]
-            return str(row.get("sigungu", str(row["code"])[:5])), f"{row['label']} (표시코드 {row['code']})"
+            return str(row["code"]), str(row["label"])
 
-    # 2순위: 후보를 순서대로 정확일치 → 끝부분 일치
-    candidates = []
-    for c in [metro_ko, county_ko, dist_ko]:
-        if c and c not in candidates:
-            candidates.append(c)
+    disp = str(data.get("display_name", ""))
+    # fallback: look for any label substring inside display_name
+    for _, row in lawd_df.iterrows():
+        lab = str(row.get("label", ""))
+        if lab and lab in disp:
+            return str(row["code"]), str(row["label"])
 
-    for c in candidates:
-        hit = lawd_df[labels == c]
-        if hit.empty:
-            hit = lawd_df[labels.str.endswith(c)]
-        if not hit.empty:
-            hit = hit.copy()
-            hit["_len"] = hit["label"].astype(str).str.len()
-            row = hit.sort_values("_len").iloc[0]
-            return str(row.get("sigungu", str(row["code"])[:5])), f"{row['label']} (표시코드 {row['code']})"
-
-    return None, f"시군구 자동 추정 실패: {(metro_ko or '')} {(county_ko or dist_ko or '')}".strip()
+    return None, f"시군구 자동 추정 실패: {metro_ko} {dist_ko}".strip()
 
 def static_map_url(lat: float, lon: float, zoom: int = 13, w: int = 1100, h: int = 620, markers: Optional[List[Tuple[float,float,str]]] = None) -> str:
     base = "https://staticmap.openstreetmap.de/staticmap.php"
@@ -717,40 +698,28 @@ with left:
             comp_tmp = build_comp_table(flt_tmp, float(exclusive_ratio), topn=10)
             # Add up to 10 markers
             for _, row in comp_tmp.iterrows():
-                nm = str(row.get("단지명", "")).strip()
-                asset = str(row.get("자산", ""))
-            
+                nm = str(row.get("단지명","")).strip()
+                asset = str(row.get("자산",""))
                 if not nm:
                     continue
-            
-                g2 = geocode_complex_name(nm, lawd_label) if 'geocode_complex_name' in globals() else None
+                g2 = geocode_complex_name(nm, lawd_label)
                 if not g2:
                     continue
-            
                 color = "blue" if asset == "아파트" else ("green" if asset == "오피스텔" else "gray")
-                tip = f"{asset} | {nm} | 공급면적 {fmt0(float(row.get('공급면적(전용+공용)',0)))}"
-            
-                folium.Marker(
-                    [g2["lat"], g2["lon"]],
-                    tooltip=tip,
-                    icon=folium.Icon(color=color)
-                ).add_to(m)
+                tip = f"{asset} | {nm} | 공급환산 {fmt0(float(row.get('공급환산(전용→공급)',0)))}"
+                folium.Marker([g2["lat"], g2["lon"]], tooltip=tip, icon=folium.Icon(color=color)).add_to(m)
 
+    out = None  # always define to avoid NameError when checkbox branches skip map rendering
+    out = st_folium(m, height=420, use_container_width=True)
 
     # Update pin on click
-    if out and out.get("last_clicked"):
+    if isinstance(out, dict) and out.get("last_clicked"):
         st.session_state["pin_lat"] = float(out["last_clicked"]["lat"])
         st.session_state["pin_lon"] = float(out["last_clicked"]["lng"])
-        # 클릭 좌표가 바뀌면 즉시 다시 실행해서(리런) 아래 "시군구 자동 추정/실거래 조회"가 자동 반영되게 합니다.
-        _lc = (st.session_state["pin_lat"], st.session_state["pin_lon"])
-        if st.session_state.get("_last_click") != _lc:
-            st.session_state["_last_click"] = _lc
-            st.rerun()
         geo = {"lat": float(st.session_state["pin_lat"]), "lon": float(st.session_state["pin_lon"])}
 
     st.caption(f"핀 좌표: {geo['lat']:.6f}, {geo['lon']:.6f}")
 
-        # 클릭할 때마다 앱이 재실행되면서(리런) 아래 자동 추정/조회가 바로 반영됩니다.
     # Infer lawd code from pin
     inferred_cd, inferred_label = infer_lawd_from_latlon(lawd_df, geo["lat"], geo["lon"])
     if inferred_cd:
@@ -819,9 +788,6 @@ with left:
             with st.spinner("실거래가 조회 중... (월별 호출 후 합산)"):
                 merged = fetch_range(int(months))
 
-                # 초기 결과 저장
-                st.session_state["merged_df"] = merged
-
                 # 자동 기간 확장: 선택 기간에 0건이면 최대 60개월까지 12개월씩 확장
                 if merged.empty:
                     st.warning("선택 기간에 실거래가가 없어 자동으로 기간을 확장해 재조회합니다. (최대 60개월)")
@@ -833,49 +799,25 @@ with left:
                             st.info(f"기간을 {m2}개월로 확장하여 실거래 {len(merged)}건을 찾았습니다.")
                             break
 
-            # 실행 결과 저장(버튼 미클릭 시에도 표 표시)
-            st.session_state["merged_df"] = merged
-
             
-# --- 조회 결과 표시(최근 실행 결과를 유지) ---
-merged = st.session_state.get("merged_df", pd.DataFrame())
 st.subheader("조회 결과")
 
-if not isinstance(merged, pd.DataFrame) or merged.empty:
+if merged.empty:
     # 표 형식으로 '없음' 표시
-    st.dataframe(
-        pd.DataFrame([{"상태": "조회된 실거래가가 없습니다", "안내": "1) 시군구 자동추정 2) 기간(YYYYMM/개월) 3) API 엔드포인트 4) 서비스키를 확인해주세요"}]),
-        use_container_width=True,
-        hide_index=True,
-    )
+    st.dataframe(pd.DataFrame([{"상태": "조회된 실거래가가 없습니다", "안내": "지역/기간/면적대/키워드를 확인해주세요"}]), use_container_width=True)
     st.session_state["filtered_df"] = pd.DataFrame()
     st.session_state["market_base_supply"] = 0.0
 else:
     st.caption(f"원본(기간 합산) {len(merged):,}건")
-    # 컬럼명이 조금씩 달라도 안전하게 처리
-    sort_cols = [c for c in ["거래일", "거래일자", "거래년월일", "거래금액(만원)", "거래금액"] if c in merged.columns]
-    if sort_cols:
-        merged_show = merged.sort_values(sort_cols[:2], ascending=[False, False] if len(sort_cols) > 1 else [False])
-    else:
-        merged_show = merged
-    st.dataframe(merged_show.head(300), use_container_width=True, hide_index=True)
+    st.dataframe(merged.sort_values(["거래일", "거래금액(만원)"], ascending=[False, False]).head(300), use_container_width=True)
 
     flt = hogang_style_filter(merged, float(target_m2), float(tol_m2), keyword, int(recent_n))
     st.caption(f"필터 적용 {len(flt):,}건 (전용 {target_m2}±{tol_m2}㎡, 키워드/최근N 적용)")
 
     if flt.empty:
-        st.dataframe(
-            pd.DataFrame([{"상태": "필터 조건에서 거래가 없습니다", "안내": "허용오차를 늘리거나 키워드를 비우고 다시 조회해보세요"}]),
-            use_container_width=True,
-            hide_index=True,
-        )
+        st.dataframe(pd.DataFrame([{"상태": "필터 조건에서 거래가 없습니다", "안내": "허용오차를 늘리거나 키워드를 비우고 다시 조회해보세요"}]), use_container_width=True)
     else:
-        sort_cols2 = [c for c in ["거래일", "거래일자", "거래년월일", "거래금액(만원)", "거래금액"] if c in flt.columns]
-        if sort_cols2:
-            flt_show = flt.sort_values(sort_cols2[:2], ascending=[False, False] if len(sort_cols2) > 1 else [False])
-        else:
-            flt_show = flt
-        st.dataframe(flt_show.head(300), use_container_width=True, hide_index=True)
+        st.dataframe(flt.sort_values(["거래일", "거래금액(만원)"], ascending=[False, False]).head(300), use_container_width=True)
 
     # 세션 저장(지도 마커/보고서에서 재사용)
     st.session_state["filtered_df"] = flt
@@ -887,14 +829,28 @@ else:
     except Exception:
         st.session_state["market_base_supply"] = 0.0
 
-    # 필터 결과 요약(최대 80건)
-    flt_show2 = st.session_state.get("filtered_df", pd.DataFrame())
-    if isinstance(flt_show2, pd.DataFrame) and not flt_show2.empty:
-        sort_col3 = "거래일자" if "거래일자" in flt_show2.columns else ("거래일" if "거래일" in flt_show2.columns else None)
-        if sort_col3:
-            st.dataframe(flt_show2.sort_values(sort_col3, ascending=False).head(80), use_container_width=True, hide_index=True)
-        else:
-            st.dataframe(flt_show2.head(80), use_container_width=True, hide_index=True)
+# 필터로 0건이면, 기간을 더 늘려 한 번 더 시도
+                if flt.empty and int(months) < 60:
+                    st.info("면적/키워드 필터로 0건이라, 기간을 60개월로 확장해 한 번 더 시도합니다.")
+                    merged2 = fetch_range(60)
+                    if not merged2.empty:
+                        flt = hogang_style_filter(merged2, float(target_m2), float(tol_m2), keyword, int(recent_n))
+
+                st.session_state["filtered_df"] = flt
+
+                if len(flt) > 0:
+                    base_supply = float(flt["평당가(원/평,전용)"].mean()) * float(exclusive_ratio)
+                    st.session_state["market_base_supply"] = float(base_supply)
+                    types = ", ".join(sorted(set(flt["자산"].astype(str).unique()))) if "자산" in flt.columns else str(product)
+                    st.success(f"{types} 실거래 {len(flt)}건 · 공급환산(매매 베이스) {fmt0(base_supply)}")
+                else:
+                    st.warning("필터 적용 후 데이터가 없습니다. (면적대/키워드/최근 N건 설정을 완화해보세요)")
+
+    flt_show = st.session_state.get("filtered_df", pd.DataFrame())
+
+    if isinstance(flt_show, pd.DataFrame) and not flt_show.empty:
+        st.dataframe(flt_show.sort_values("거래일자", ascending=False).head(80), use_container_width=True, hide_index=True)
+
 with right:
     st.subheader("입지/브랜드 가중치")
     loc_grade = st.selectbox("입지 등급(프리셋)", list(LOCATION_PRESETS.keys()), index=2, key="loc_grade")
