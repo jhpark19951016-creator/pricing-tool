@@ -751,7 +751,10 @@ with left:
     st.caption("아파트/오피스텔 모두 ‘운영(일반) 실거래 API’ 엔드포인트로 조회합니다.")
     run = st.button("실거래 조회 / 재계산", type="primary", key="btn_run")
 
-    if "filtered_df" not in st.session_state:
+    if "merged" not in st.session_state:
+        st.session_state["merged"] = pd.DataFrame()
+
+if "filtered_df" not in st.session_state:
         st.session_state["filtered_df"] = pd.DataFrame()
     if "market_base_supply" not in st.session_state:
         st.session_state["market_base_supply"] = 0.0
@@ -787,14 +790,17 @@ with left:
 
             with st.spinner("실거래가 조회 중... (월별 호출 후 합산)"):
                 merged = fetch_range(int(months))
+                st.session_state['merged'] = merged
 
                 # 자동 기간 확장: 선택 기간에 0건이면 최대 60개월까지 12개월씩 확장
-                if merged.empty:
+                merged = st.session_state.get('merged', pd.DataFrame())
+if merged.empty:
                     st.warning("선택 기간에 실거래가가 없어 자동으로 기간을 확장해 재조회합니다. (최대 60개월)")
                     for m2 in [24, 36, 48, 60]:
                         if m2 <= int(months):
                             continue
                         merged = fetch_range(m2)
+                        st.session_state['merged'] = merged
                         if not merged.empty:
                             st.info(f"기간을 {m2}개월로 확장하여 실거래 {len(merged)}건을 찾았습니다.")
                             break
@@ -802,6 +808,7 @@ with left:
             
 st.subheader("조회 결과")
 
+merged = st.session_state.get('merged', pd.DataFrame())
 if merged.empty:
     # 표 형식으로 '없음' 표시
     st.dataframe(pd.DataFrame([{"상태": "조회된 실거래가가 없습니다", "안내": "지역/기간/면적대/키워드를 확인해주세요"}]), use_container_width=True)
