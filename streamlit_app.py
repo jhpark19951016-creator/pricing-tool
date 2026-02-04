@@ -721,7 +721,7 @@ with left:
                 asset = str(row.get("자산",""))
                 if not nm:
                     continue
-                g2 = geocode_complex_name(nm, lawd_label)
+        g2 = geocode_complex_name(nm, lawd_label) if 'geocode_complex_name' in globals() else None
                 if not g2:
                     continue
                 color = "blue" if asset == "아파트" else ("green" if asset == "오피스텔" else "gray")
