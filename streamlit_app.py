@@ -1,3 +1,4 @@
+st.write("✅ BUILD: 2026-02-04 auto/10digit/weights")
 # -*- coding: utf-8 -*-
 """
 분양가 산정 Tool (최종 안정 버전)
