@@ -286,7 +286,30 @@ if test_btn:
         st.error(f"테스트 실패: {mask_secret(hint)}")
 
 # --- 지도 ---
-m = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=13)
+# v13: Folium 엔진은 유지하되, 배경지도를 카카오 타일로 교체합니다(기존 기능/클릭좌표/자동추적 로직 영향 없음).
+m = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=13, tiles=None, control_scale=True)
+
+# ✅ Kakao(daum) 타일: 키 없이 표시되는 공개 타일을 사용합니다.
+#    (화면/UX 개선용 1단계. 다음 단계(v14)에서 카카오 JS SDK로 완전 전환 예정)
+KAKAO_TILES = "https://map.daumcdn.net/map_2d/1900hdi/L{z}/{y}/{x}.png"
+folium.TileLayer(
+    tiles=KAKAO_TILES,
+    name="Kakao",
+    attr="Kakao",
+    overlay=False,
+    control=False,
+    max_zoom=19,
+).add_to(m)
+
+# 예비용: OSM 타일(혹시 카카오 타일이 일시적으로 느리거나 막히면 대비)
+folium.TileLayer(
+    tiles="OpenStreetMap",
+    name="OSM",
+    attr="OpenStreetMap",
+    overlay=False,
+    control=False,
+).add_to(m)
+
 folium.Marker([st.session_state.lat, st.session_state.lon]).add_to(m)
 out = st_folium(m, height=420, use_container_width=True)
 
@@ -391,4 +414,4 @@ if st.button("실거래 조회"):
                 st.success(f"총 {len(merged):,}건")
                 st.dataframe(merged.head(500), use_container_width=True)
 
-st.caption("안정형 v12 – resultCode=000도 정상 처리 + Dev 엔드포인트 제거(403 회피) + serviceKey 이중 인코딩 방지 + 오류(resultCode/resultMsg) 표시")
+st.caption("안정형 v13 – (1단계) 지도 카카오 타일 적용 + resultCode=000 정상 처리 + Dev 엔드포인트 제거(403 회피) + serviceKey 이중 인코딩 방지 + 오류(resultCode/resultMsg) 표시")
