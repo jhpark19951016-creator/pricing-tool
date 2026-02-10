@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import os, re, json, datetime as dt, time
+from urllib.parse import unquote
 import pandas as pd, requests, streamlit as st, folium
 from streamlit_folium import st_folium
 import xml.etree.ElementTree as ET
@@ -19,7 +20,7 @@ DEFAULT_CENTER = (37.5665, 126.9780)
 APT_URL = "https://apis.data.go.kr/1613000/RTMSDataSvcAptTradeDev/getRTMSDataSvcAptTradeDev"
 OFFI_URL = "https://apis.data.go.kr/1613000/RTMSDataSvcOffiTradeDev/getRTMSDataSvcOffiTradeDev"
 
-SERVICE_KEY = st.secrets.get("SERVICE_KEY", os.environ.get("SERVICE_KEY", "")).strip()
+SERVICE_KEY_RAW = st.secrets.get("SERVICE_KEY", os.environ.get("SERVICE_KEY", "")).strip()
 VWORLD_KEY = st.secrets.get("VWORLD_KEY", os.environ.get("VWORLD_KEY", "")).strip()
 KAKAO_KEY = (
     st.secrets.get("KAKAO_REST_API_KEY", "")
@@ -44,10 +45,7 @@ if HTTPAdapter and Retry:
     _session.mount("https://", adapter)
     _session.mount("http://", adapter)
 
-DEFAULT_HEADERS = {
-    "User-Agent": "pricing-tool/1.0 (streamlit)",
-    "Accept": "application/json",
-}
+DEFAULT_HEADERS = {"User-Agent": "pricing-tool/1.0 (streamlit)", "Accept": "application/json"}
 
 
 def make_year_month_options(months: int = 72):
@@ -68,27 +66,39 @@ def make_year_month_options(months: int = 72):
 def mask_secret(text: str) -> str:
     if not text:
         return text
-    for k in (VWORLD_KEY, SERVICE_KEY, KAKAO_KEY):
+    for k in (VWORLD_KEY, SERVICE_KEY_RAW, KAKAO_KEY):
         if k:
             text = text.replace(k, "***KEY***")
     return text
 
 
+def normalize_service_key(k: str) -> str:
+    """serviceKey 이중 인코딩 방지: '%' 포함 시 unquote로 1회 디코딩."""
+    if not k:
+        return ""
+    if "%" in k:
+        try:
+            return unquote(k)
+        except Exception:
+            return k
+    return k
+
+
+SERVICE_KEY = normalize_service_key(SERVICE_KEY_RAW)
+
+
 def _extract_bjd_from_vworld_json(data):
-    # 구조화: response.result[].code.bjdCd
     try:
         for it in data.get("response", {}).get("result", []):
             code = (it.get("code") or {})
             if "bjdCd" in code and isinstance(code["bjdCd"], str) and re.fullmatch(r"\d{10}", code["bjdCd"]):
                 return code["bjdCd"]
-            # PNU(19자리) → 앞 10자리
             for key in ("pnu", "PNU"):
                 if key in it and isinstance(it[key], str) and re.fullmatch(r"\d{19}", it[key]):
                     return it[key][:10]
     except Exception:
         pass
 
-    # 전체에서 19/10자리 탐색
     try:
         s = json.dumps(data, ensure_ascii=False)
     except Exception:
@@ -103,7 +113,6 @@ def _extract_bjd_from_vworld_json(data):
 
 
 def _extract_label_from_vworld_json(data):
-    # result[0].text 가 가장 흔함
     try:
         rs = data.get("response", {}).get("result", [])
         if rs and isinstance(rs, list):
@@ -139,25 +148,21 @@ def vworld_reverse_geocode(lat: float, lon: float):
                 r = _session.get(url, params=params, headers=DEFAULT_HEADERS, timeout=12)
             except Exception as e:
                 return None, f"VWorld 연결 실패({type(e).__name__}): {mask_secret(repr(e))}", ""
-
             if r.status_code != 200:
                 last_hint = f"type={tp}, HTTP={r.status_code}"
                 if r.status_code in (429, 500, 502, 503, 504) and attempt == 0:
                     time.sleep(0.9)
                     continue
                 break
-
             try:
                 data = r.json()
-            except Exception as e:
-                last_hint = f"type={tp}, JSON 파싱 실패: {type(e).__name__}"
+            except Exception:
+                last_hint = f"type={tp}, JSON 파싱 실패"
                 break
 
             vw_status = (data.get("response") or {}).get("status")
             vw_msg = (data.get("response") or {}).get("message")
             last_hint = f"type={tp}, HTTP=200, vworld_status={vw_status}, msg={vw_msg}"
-
-            # 라벨은 OK/ERROR 관계없이 캐치 시도
             last_label = _extract_label_from_vworld_json(data) or last_label
 
             if vw_status and str(vw_status).upper() != "OK":
@@ -174,10 +179,8 @@ def vworld_reverse_geocode(lat: float, lon: float):
 
 
 def kakao_reverse_geocode(lat: float, lon: float):
-    """카카오 로컬 API: coord2regioncode → 법정동코드(10자리) (region_type=B) + 라벨(시/구/동)"""
     if not KAKAO_KEY:
         return None, "KAKAO_REST_API_KEY 없음", ""
-
     url = "https://dapi.kakao.com/v2/local/geo/coord2regioncode.json"
     params = {"x": str(lon), "y": str(lat)}
     headers = dict(DEFAULT_HEADERS)
@@ -193,31 +196,26 @@ def kakao_reverse_geocode(lat: float, lon: float):
 
     try:
         data = r.json()
-    except Exception as e:
-        return None, f"Kakao JSON 파싱 실패: {type(e).__name__}", ""
+    except Exception:
+        return None, "Kakao JSON 파싱 실패", ""
 
     docs = data.get("documents", []) if isinstance(data, dict) else []
     picked = None
-
-    # region_type: B(법정동) / H(행정동)
     for d in docs:
         if d.get("region_type") == "B":
             code = d.get("code")
             if isinstance(code, str) and re.fullmatch(r"\d{10}", code):
                 picked = d
                 break
-
     if not picked and docs:
         picked = docs[0]
 
     if picked:
         code = picked.get("code")
-        # 라벨 조합
         r1 = (picked.get("region_1depth_name") or "").strip()
         r2 = (picked.get("region_2depth_name") or "").strip()
         r3 = (picked.get("region_3depth_name") or "").strip()
         label = " ".join([x for x in (r1, r2, r3) if x])
-
         if isinstance(code, str) and re.fullmatch(r"\d{10}", code):
             rt = picked.get("region_type")
             return code, f"Kakao OK(region_type={rt})", label
@@ -226,13 +224,11 @@ def kakao_reverse_geocode(lat: float, lon: float):
 
 
 def resolve_bjd_code(lat: float, lon: float, provider: str):
-    """provider: auto | vworld | kakao  -> (code, hint, label)"""
     if provider == "vworld":
         return vworld_reverse_geocode(lat, lon)
     if provider == "kakao":
         return kakao_reverse_geocode(lat, lon)
 
-    # auto
     code, hint, label = vworld_reverse_geocode(lat, lon)
     if code:
         return code, f"[AUTO] {hint}", label
@@ -265,6 +261,12 @@ with st.sidebar:
 
     test_btn = st.button("연결 테스트(서울시청)")
 
+    with st.expander("키 상태(진단)", expanded=False):
+        st.write("SERVICE_KEY:", "✅" if SERVICE_KEY else "❌")
+        st.write("SERVICE_KEY(원문/디코딩):", "디코딩됨" if (SERVICE_KEY_RAW and SERVICE_KEY != SERVICE_KEY_RAW) else "그대로")
+        st.write("KAKAO_REST_API_KEY:", "✅" if KAKAO_KEY else "❌")
+        st.write("VWORLD_KEY:", "✅" if VWORLD_KEY else "❌")
+
 # --- 상태값 ---
 st.session_state.setdefault("lat", DEFAULT_CENTER[0])
 st.session_state.setdefault("lon", DEFAULT_CENTER[1])
@@ -281,10 +283,6 @@ if test_btn:
         st.success(f"테스트 성공: {code}  /  {label or '-'}  /  {mask_secret(hint)}")
     else:
         st.error(f"테스트 실패: {mask_secret(hint)}")
-        if provider in ("auto", "vworld") and not VWORLD_KEY:
-            st.info("VWORLD_KEY가 Secrets에 없어서 VWorld 테스트를 할 수 없습니다.")
-        if provider in ("auto", "kakao") and not KAKAO_KEY:
-            st.info("KAKAO_REST_API_KEY가 Secrets에 없어서 Kakao 테스트를 할 수 없습니다.")
 
 # --- 지도 ---
 m = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=13)
@@ -310,7 +308,7 @@ if auto_track:
             st.warning("법정동코드 자동추적 실패(수동 입력 가능).")
         st.session_state.last_latlon = key
 
-# --- 표시: 동 이름(라벨) ---
+# --- 표시: 동 이름 ---
 if st.session_state.get("last_label"):
     st.subheader("선택 위치(법정동)")
     st.info(st.session_state.last_label)
@@ -322,13 +320,38 @@ st.subheader("법정동코드(10자리)")
 st.session_state.lawd10 = st.text_input("법정동코드 입력", value=st.session_state.lawd10)
 
 
-# --- 실거래 조회 ---
+def parse_opendata_error(xml_text: str):
+    try:
+        root = ET.fromstring(xml_text)
+        code = root.findtext(".//resultCode")
+        msg = root.findtext(".//resultMsg")
+        if code or msg:
+            return (code or "").strip(), (msg or "").strip()
+    except Exception:
+        pass
+    return "", ""
+
+
 def fetch_rtms(url: str, lawd5: str, ym: str) -> pd.DataFrame:
     params = {"serviceKey": SERVICE_KEY, "LAWD_CD": lawd5, "DEAL_YMD": ym, "numOfRows": 1000, "pageNo": 1}
-    r = _session.get(url, params=params, headers=DEFAULT_HEADERS, timeout=20)
-    r.raise_for_status()
+    r = _session.get(url, params=params, headers={"User-Agent": DEFAULT_HEADERS["User-Agent"]}, timeout=20)
+
+    if r.status_code != 200:
+        c, m = parse_opendata_error(r.text)
+        hint = f"HTTP {r.status_code}"
+        if c or m:
+            hint += f" / resultCode={c} / resultMsg={m}"
+        raise RuntimeError(hint)
+
+    c, m = parse_opendata_error(r.text)
+    if c and c != "00":
+        raise RuntimeError(f"resultCode={c} / resultMsg={m}")
+
     root = ET.fromstring(r.text)
-    return pd.DataFrame([{c.tag: c.text for c in list(it)} for it in root.findall(".//item")])
+    items = root.findall(".//item")
+    if not items:
+        return pd.DataFrame()
+    return pd.DataFrame([{c.tag: c.text for c in list(it)} for it in items])
 
 
 if st.button("실거래 조회"):
@@ -340,23 +363,29 @@ if st.button("실거래 조회"):
         lawd5 = st.session_state.lawd10[:5]
         dfs = []
         y, m0 = int(end_ym[:4]), int(end_ym[4:])
-        for i in range(months_back):
-            mm = m0 - i
-            yy = y
-            while mm <= 0:
-                yy -= 1
-                mm += 12
-            ym = f"{yy:04d}{mm:02d}"
-            if product in ("아파트", "아파트+오피스텔"):
-                dfs.append(fetch_rtms(APT_URL, lawd5, ym))
-            if product in ("오피스텔", "아파트+오피스텔"):
-                dfs.append(fetch_rtms(OFFI_URL, lawd5, ym))
-
-        merged = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
-        if merged.empty:
-            st.warning("조회된 실거래가가 없습니다.")
+        try:
+            for i in range(months_back):
+                mm = m0 - i
+                yy = y
+                while mm <= 0:
+                    yy -= 1
+                    mm += 12
+                ym = f"{yy:04d}{mm:02d}"
+                if product in ("아파트", "아파트+오피스텔"):
+                    dfs.append(fetch_rtms(APT_URL, lawd5, ym))
+                if product in ("오피스텔", "아파트+오피스텔"):
+                    dfs.append(fetch_rtms(OFFI_URL, lawd5, ym))
+        except Exception as e:
+            st.error("실거래 조회 중 오류가 발생했습니다.")
+            st.code(mask_secret(str(e)))
+            if show_debug:
+                st.caption("TIP) resultMsg에 'SERVICE KEY IS NOT REGISTERED' 또는 'INVALID'가 나오면 serviceKey 이중 인코딩 문제일 가능성이 큽니다.")
         else:
-            st.success(f"총 {len(merged):,}건")
-            st.dataframe(merged.head(200), use_container_width=True)
+            merged = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+            if merged.empty:
+                st.warning("조회된 실거래가가 없습니다.")
+            else:
+                st.success(f"총 {len(merged):,}건")
+                st.dataframe(merged.head(500), use_container_width=True)
 
-st.caption("안정형 v9 – (요청사항 #1) 법정동명(시/구/동) 표시 + 기존 자동추적(AUTO/VWorld/Kakao) 유지")
+st.caption("안정형 v10 – (실거래 조회 안정화) serviceKey 이중 인코딩 방지 + 공공데이터포털 오류(resultCode/resultMsg) 표시")
