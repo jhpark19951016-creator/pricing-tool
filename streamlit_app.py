@@ -1,4 +1,6 @@
 
+st.write("BUILD:", "v1.1-202602-fixed")
+
 # -*- coding: utf-8 -*-
 import os, datetime as dt
 import pandas as pd
