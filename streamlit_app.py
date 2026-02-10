@@ -4,7 +4,6 @@ import pandas as pd, requests, streamlit as st, folium
 from streamlit_folium import st_folium
 import xml.etree.ElementTree as ET
 
-# (선택) requests 재시도 설정
 try:
     from requests.adapters import HTTPAdapter
     from urllib3.util.retry import Retry
@@ -27,10 +26,10 @@ VWORLD_KEY = st.secrets.get("VWORLD_KEY", os.environ.get("VWORLD_KEY", "")).stri
 _session = requests.Session()
 if HTTPAdapter and Retry:
     retry = Retry(
-        total=3,
-        connect=3,
-        read=3,
-        backoff_factor=0.6,
+        total=4,
+        connect=4,
+        read=4,
+        backoff_factor=0.7,
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=("GET",),
         raise_on_status=False,
@@ -39,7 +38,7 @@ if HTTPAdapter and Retry:
     _session.mount("https://", adapter)
     _session.mount("http://", adapter)
 
-
+# --- helpers ---
 def make_year_month_options(months: int = 72):
     today = dt.date.today()
     pairs = []
@@ -55,86 +54,136 @@ def make_year_month_options(months: int = 72):
     return years, months_by_year
 
 
-def extract_10digit_code(obj):
-    try:
-        s = json.dumps(obj, ensure_ascii=False)
-    except Exception:
-        s = str(obj)
-    m = re.search(r"\b\d{10}\b", s)
-    return m.group(0) if m else None
-
-
 def mask_secret(text: str) -> str:
     if not text:
         return text
     if VWORLD_KEY:
         text = text.replace(VWORLD_KEY, "***VWORLD_KEY***")
     if SERVICE_KEY:
-        # 공공데이터포털 키는 길고 urlencoded로 섞일 수 있어 완전 치환은 어렵지만, 최소한 원문은 숨김
         text = text.replace(SERVICE_KEY, "***SERVICE_KEY***")
     return text
 
 
-def vworld_reverse_geocode(lat: float, lon: float):
-    """VWorld 역지오코딩 → 법정동코드(10자리) 반환. (502 등 서버 오류 대비: 재시도 + 안전 파싱)"""
+def _find_first(obj, pred):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if pred(k, v):
+                return k, v
+            found = _find_first(v, pred)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for v in obj:
+            found = _find_first(v, pred)
+            if found:
+                return found
+    return None
+
+
+def _extract_bjd_from_vworld_json(data):
+    # 1) 구조화: response.result[].code.bjdCd
+    try:
+        for it in data.get("response", {}).get("result", []):
+            code = (it.get("code") or {})
+            for key in ("bjdCd", "bjdongCd", "bjd_code"):
+                if key in code and isinstance(code[key], str) and re.fullmatch(r"\d{10}", code[key]):
+                    return code[key]
+            # 2) PNU(19자리) → 앞 10자리 = 법정동코드
+            for key in ("pnu", "PNU"):
+                if key in it and isinstance(it[key], str) and re.fullmatch(r"\d{19}", it[key]):
+                    return it[key][:10]
+            # 종종 text/address에 섞여 들어오는 경우 대비
+            hit = _find_first(it, lambda k, v: isinstance(v, str) and re.fullmatch(r"\d{19}", v) and "pnu" in str(k).lower())
+            if hit:
+                return str(hit[1])[:10]
+    except Exception:
+        pass
+
+    # 3) 전체 JSON에서 19자리/10자리 패턴 탐색 (백업)
+    try:
+        s = json.dumps(data, ensure_ascii=False)
+    except Exception:
+        s = str(data)
+
+    m19 = re.search(r"\b\d{19}\b", s)
+    if m19:
+        return m19.group(0)[:10]
+    m10 = re.search(r"\b\d{10}\b", s)
+    if m10:
+        return m10.group(0)
+
+    return None
+
+
+def vworld_reverse_geocode(lat: float, lon: float, show_debug: bool = False):
+    """VWorld 역지오코딩 → 법정동코드(10자리) 반환.
+    - PARCEL → BOTH → ROAD 순으로 시도
+    - 5xx/429는 재시도 + 약간의 텀
+    - bjdCd가 없으면 PNU(19자리)에서 앞 10자리 추출
+    """
     if not VWORLD_KEY:
-        return None
+        raise RuntimeError("VWORLD_KEY가 없습니다.")
 
     url = "https://api.vworld.kr/req/address"
-    params = {
+    base_params = {
         "service": "address",
         "request": "getAddress",
         "version": "2.0",
         "crs": "epsg:4326",
         "point": f"{lon},{lat}",
         "format": "json",
-        "type": "BOTH",  # PARCEL보다 안정적
         "key": VWORLD_KEY,
     }
 
-    # requests Retry가 있더라도, 간헐 502는 한 번 더 텀을 두고 시도하면 잘 풀리는 경우가 많아 1회 추가
-    for attempt in range(2):
-        r = _session.get(url, params=params, timeout=12)
-        # 200이 아니면 상태코드만 보고 None 처리(경고는 상위에서)
-        if r.status_code != 200:
-            # 502/503 등이면 잠깐 쉬고 한 번 더
-            if r.status_code in (429, 500, 502, 503, 504) and attempt == 0:
-                time.sleep(0.8)
-                continue
-            raise requests.HTTPError(f"VWorld HTTP {r.status_code}")
+    last_debug = None
 
-        data = r.json()
+    for tp in ("PARCEL", "BOTH", "ROAD"):
+        params = dict(base_params)
+        params["type"] = tp
 
-        # 1) 구조화 필드 우선
-        try:
-            for it in data.get("response", {}).get("result", []):
-                if "code" in it and "bjdCd" in it["code"]:
-                    return it["code"]["bjdCd"]
-        except Exception:
-            pass
+        # type별로 2회 시도(간헐 502/빈 응답 대비)
+        for attempt in range(2):
+            r = _session.get(url, params=params, timeout=12)
+            status = r.status_code
 
-        # 2) 전체에서 10자리 패턴 탐색
-        code = extract_10digit_code(data)
-        if code:
-            return code
+            # HTTP 오류면 다음 시도
+            if status != 200:
+                last_debug = f"type={tp}, HTTP={status}"
+                if status in (429, 500, 502, 503, 504) and attempt == 0:
+                    time.sleep(0.9)
+                    continue
+                # 다음 type으로 넘어가게만 처리
+                break
 
-        return None
+            try:
+                data = r.json()
+            except Exception as e:
+                last_debug = f"type={tp}, JSON 파싱 실패: {e}"
+                break
 
-    return None
+            # VWorld 내부 status 체크
+            vw_status = (data.get("response") or {}).get("status")
+            vw_msg = (data.get("response") or {}).get("message")
+            if vw_status and str(vw_status).upper() != "OK":
+                last_debug = f"type={tp}, VWorld status={vw_status}, msg={vw_msg}"
+                # 다음 attempt/type 시도
+                break
+
+            code = _extract_bjd_from_vworld_json(data)
+            if code:
+                return code, last_debug
+
+            # 200인데 코드가 없으면 다음 attempt/type
+            last_debug = f"type={tp}, 200 OK but no code"
+            if attempt == 0:
+                time.sleep(0.4)
+
+    if show_debug:
+        raise RuntimeError(mask_secret(str(last_debug)))
+    return None, last_debug
 
 
-def nominatim_reverse_geocode(lat: float, lon: float):
-    """(백업) OSM Nominatim 역지오코딩: 법정동코드 자체는 안 주지만, 주소 표시용으로만 사용."""
-    url = "https://nominatim.openstreetmap.org/reverse"
-    params = {"format": "jsonv2", "lat": str(lat), "lon": str(lon), "zoom": 18, "addressdetails": 1}
-    headers = {"User-Agent": "price-tool/1.0 (streamlit)"}
-    r = _session.get(url, params=params, headers=headers, timeout=12)
-    if r.status_code != 200:
-        return None
-    data = r.json()
-    return data.get("display_name")
-
-
+# --- UI ---
 with st.sidebar:
     st.header("설정")
     product = st.selectbox("상품", ["아파트", "오피스텔", "아파트+오피스텔"], index=2)
@@ -155,14 +204,14 @@ with st.sidebar:
     show_debug = st.toggle("디버그(오류 상세) 보기", value=False)
 
     if auto_track and not VWORLD_KEY:
-        st.warning("VWORLD_KEY가 Secrets에 없습니다. (자동추적 OFF 또는 키 등록 필요)")
+        st.warning("VWORLD_KEY가 Secrets에 없습니다. 자동추적이 동작하지 않습니다.")
 
 
 st.session_state.setdefault("lat", DEFAULT_CENTER[0])
 st.session_state.setdefault("lon", DEFAULT_CENTER[1])
 st.session_state.setdefault("lawd10", "")
 st.session_state.setdefault("last_latlon", None)
-st.session_state.setdefault("last_addr_label", "")
+st.session_state.setdefault("last_debug_hint", "")
 
 m = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=13)
 folium.Marker([st.session_state.lat, st.session_state.lon]).add_to(m)
@@ -174,33 +223,34 @@ if isinstance(out, dict) and out.get("last_clicked"):
 
 st.write("핀 좌표:", st.session_state.lat, st.session_state.lon)
 
-# --- 자동추적 ---
+# --- 자동추적 실행 ---
 if auto_track and VWORLD_KEY:
     key = (round(st.session_state.lat, 6), round(st.session_state.lon, 6))
     if st.session_state.last_latlon != key:
         try:
-            code = vworld_reverse_geocode(st.session_state.lat, st.session_state.lon)
+            code, hint = vworld_reverse_geocode(st.session_state.lat, st.session_state.lon, show_debug=show_debug)
+            st.session_state.last_debug_hint = hint or ""
             if code:
                 st.session_state.lawd10 = code
-                st.session_state.last_addr_label = ""
             else:
-                # 법정동코드를 못 받으면 주소 라벨만이라도 백업(사용자에게 상황 설명)
-                st.session_state.last_addr_label = nominatim_reverse_geocode(st.session_state.lat, st.session_state.lon) or ""
-                st.warning("법정동코드를 자동으로 가져오지 못했습니다. (수동 입력 가능)")
+                st.warning("법정동코드 자동추적 실패(수동 입력 가능).")
+                if show_debug and hint:
+                    st.code(mask_secret(hint))
         except Exception as e:
-            msg = mask_secret(str(e))
             st.warning("법정동코드 자동추적 실패(수동 입력 가능).")
             if show_debug:
-                st.code(msg)
+                st.code(mask_secret(str(e)))
         st.session_state.last_latlon = key
 
-if st.session_state.get("last_addr_label"):
-    st.caption(f"참고 주소(백업): {st.session_state.last_addr_label}")
+# 디버그 OFF여도 최소 힌트는 보여줌(키는 마스킹)
+if st.session_state.get("last_debug_hint"):
+    st.caption(f"자동추적 상태: {mask_secret(st.session_state.last_debug_hint)}")
 
 st.subheader("법정동코드(10자리)")
 st.session_state.lawd10 = st.text_input("법정동코드 입력", value=st.session_state.lawd10)
 
 
+# --- 실거래 조회 ---
 def fetch_rtms(url: str, lawd5: str, ym: str) -> pd.DataFrame:
     params = {"serviceKey": SERVICE_KEY, "LAWD_CD": lawd5, "DEAL_YMD": ym, "numOfRows": 1000, "pageNo": 1}
     r = _session.get(url, params=params, timeout=20)
@@ -236,4 +286,4 @@ if st.button("실거래 조회"):
             st.success(f"총 {len(merged):,}건")
             st.dataframe(merged.head(200), use_container_width=True)
 
-st.caption("안정형 v5 – VWorld 502/서버오류 재시도 + 키 마스킹 + 주소 백업표시")
+st.caption("안정형 v6 – VWorld PARCEL/BOTH/ROAD 순차 시도 + PNU(19자리)에서 법정동코드 추출 + 최소 상태 힌트")
