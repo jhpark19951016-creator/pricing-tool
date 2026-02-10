@@ -14,3 +14,7 @@ SERVICE_KEY = "공공데이터포털 디코딩 키"
 KAKAO_REST_API_KEY = "카카오 REST API 키"
 # VWORLD_KEY = "VWorld 키"(옵션)
 ```
+
+
+## v12 변경사항
+- 공공데이터포털 RTMS 응답의 `resultCode`가 `000`로 내려오는 경우도 정상으로 처리하도록 수정

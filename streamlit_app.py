@@ -346,7 +346,8 @@ def fetch_rtms(url: str, lawd5: str, ym: str) -> pd.DataFrame:
         raise RuntimeError(hint)
 
     c, m = parse_opendata_error(r.text)
-    if c and c != "00":
+    # 공공데이터포털은 정상도 resultCode가 "00" 또는 "000" 등으로 내려올 수 있습니다.
+    if c and c not in ("00", "000", "0"):
         raise RuntimeError(f"resultCode={c} / resultMsg={m}")
 
     root = ET.fromstring(r.text)
@@ -390,4 +391,4 @@ if st.button("실거래 조회"):
                 st.success(f"총 {len(merged):,}건")
                 st.dataframe(merged.head(500), use_container_width=True)
 
-st.caption("안정형 v11 – Dev 엔드포인트 제거(403 회피) + serviceKey 이중 인코딩 방지 + 오류(resultCode/resultMsg) 표시")
+st.caption("안정형 v12 – resultCode=000도 정상 처리 + Dev 엔드포인트 제거(403 회피) + serviceKey 이중 인코딩 방지 + 오류(resultCode/resultMsg) 표시")
