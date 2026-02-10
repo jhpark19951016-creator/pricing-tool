@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
+import re
+import json
 import datetime as dt
 
 import pandas as pd
@@ -17,7 +19,17 @@ DEFAULT_CENTER = (37.5665, 126.9780)
 APT_URL = "https://apis.data.go.kr/1613000/RTMSDataSvcAptTradeDev/getRTMSDataSvcAptTradeDev"
 OFFI_URL = "https://apis.data.go.kr/1613000/RTMSDataSvcOffiTradeDev/getRTMSDataSvcOffiTradeDev"
 
+# 공공데이터포털(실거래) 키
 SERVICE_KEY = st.secrets.get("SERVICE_KEY", os.environ.get("SERVICE_KEY", "")).strip()
+
+# ✅ 법정동코드 자동추적용 (VWorld 역지오코딩 등)
+# - 아래 중 아무 키 이름으로 넣어도 인식합니다.
+VWORLD_KEY = (
+    st.secrets.get("VWORLD_KEY", "")
+    or st.secrets.get("VWORLD_API_KEY", "")
+    or os.environ.get("VWORLD_KEY", "")
+    or os.environ.get("VWORLD_API_KEY", "")
+).strip()
 
 
 def make_year_month_options(months: int = 72):
@@ -38,6 +50,41 @@ def make_year_month_options(months: int = 72):
         ms = sorted({mm for y2, mm in pairs if y2 == yy}, reverse=True)
         months_by_year[yy] = ms
     return years, months_by_year
+
+
+def _extract_10digit_code(obj):
+    """응답(JSON) 어디에 있든 10자리 숫자를 찾아 첫 번째를 반환."""
+    try:
+        s = json.dumps(obj, ensure_ascii=False)
+    except Exception:
+        s = str(obj)
+    m = re.search(r"\b\d{10}\b", s)
+    return m.group(0) if m else None
+
+
+def vworld_reverse_geocode(lat: float, lon: float):
+    """VWorld 역지오코딩 → 법정동코드(10자리) 추출 시도."""
+    if not VWORLD_KEY:
+        return None
+
+    url = "https://api.vworld.kr/req/address"
+    params = {
+        "service": "address",
+        "request": "getAddress",
+        "version": "2.0",
+        "crs": "epsg:4326",
+        "point": f"{lon},{lat}",  # VWorld는 lon,lat
+        "format": "json",
+        "type": "PARCEL",
+        "key": VWORLD_KEY,
+    }
+
+    r = requests.get(url, params=params, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+
+    # 안전하게 10자리 숫자 패턴을 전역 탐색
+    return _extract_10digit_code(data)
 
 
 with st.sidebar:
@@ -86,21 +133,45 @@ with st.sidebar:
     )
     months_back = int(recent_options[최근기간_라벨])
 
+    st.divider()
+    st.subheader("법정동코드 자동 추적")
+    auto_track = st.toggle("지도 클릭 시 법정동코드 자동 입력", value=True, key="auto_track")
+    if auto_track and not VWORLD_KEY:
+        st.warning("자동추적용 API 키(VWORLD_KEY)가 Secrets에 없습니다. 수동 입력은 가능합니다.")
 
+
+# 지도/좌표 상태값
 st.session_state.setdefault("lat", DEFAULT_CENTER[0])
 st.session_state.setdefault("lon", DEFAULT_CENTER[1])
 st.session_state.setdefault("lawd10", "")
+st.session_state.setdefault("last_rg_latlon", None)  # 역지오코딩 호출 중복 방지
 
+# 지도 표시
 m = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=13)
 folium.Marker([st.session_state.lat, st.session_state.lon], tooltip="대상지").add_to(m)
 out = st_folium(m, height=420, use_container_width=True)
 
+# 클릭 좌표 반영
 if isinstance(out, dict) and out.get("last_clicked"):
     st.session_state.lat = out["last_clicked"]["lat"]
     st.session_state.lon = out["last_clicked"]["lng"]
 
 st.write("핀 좌표:", st.session_state.lat, st.session_state.lon)
 
+# ✅ 자동추적: 좌표가 바뀌었을 때만 역지오코딩 수행
+if st.session_state.get("auto_track", True) and VWORLD_KEY:
+    latlon_key = (round(st.session_state.lat, 6), round(st.session_state.lon, 6))
+    if st.session_state.last_rg_latlon != latlon_key:
+        try:
+            code10 = vworld_reverse_geocode(st.session_state.lat, st.session_state.lon)
+            if code10:
+                st.session_state.lawd10 = code10
+        except Exception as e:
+            st.warning(f"법정동코드 자동추적 실패(수동 입력 가능): {e}")
+        finally:
+            st.session_state.last_rg_latlon = latlon_key
+
+# 입력 UI (자동으로 채워지되, 사용자가 수정 가능)
 st.subheader("법정동코드(10자리)")
 st.session_state.lawd10 = st.text_input("법정동코드 입력", value=st.session_state.lawd10)
 
@@ -126,11 +197,11 @@ def fetch_rtms(url: str, lawd5: str, ym: str) -> pd.DataFrame:
 
 if st.button("실거래 조회"):
     if not SERVICE_KEY:
-        st.error("SERVICE_KEY가 없습니다. Streamlit Secrets에 등록해주세요.")
-    elif not st.session_state.lawd10:
-        st.error("법정동코드를 입력하세요.")
+        st.error("SERVICE_KEY(실거래 API)가 없습니다. Streamlit Secrets에 등록해주세요.")
+    elif not st.session_state.lawd10 or len(str(st.session_state.lawd10).strip()) < 5:
+        st.error("법정동코드를 입력하세요. (최소 5자리 필요)")
     else:
-        lawd5 = st.session_state.lawd10[:5]
+        lawd5 = str(st.session_state.lawd10).strip()[:5]
         dfs = []
 
         y, m0 = int(end_ym[:4]), int(end_ym[4:])
@@ -154,4 +225,4 @@ if st.button("실거래 조회"):
             st.success(f"총 {len(merged):,}건")
             st.dataframe(merged.head(200), use_container_width=True)
 
-st.caption("GitHub + Streamlit Cloud 기준 안정형 베이스 (년/월 분리 선택형 + 최근기간 선택형)")
+st.caption("안정형 베이스 (년/월 분리 선택형 + 최근기간 선택형 + 법정동코드 자동추적[VWorld])")
