@@ -45,7 +45,6 @@ if HTTPAdapter and Retry:
     _session.mount("http://", adapter)
 
 DEFAULT_HEADERS = {
-    # 일부 공공/상용 API는 User-Agent 없으면 차단/불안정해지는 경우가 있어 기본 지정
     "User-Agent": "pricing-tool/1.0 (streamlit)",
     "Accept": "application/json",
 }
@@ -103,9 +102,22 @@ def _extract_bjd_from_vworld_json(data):
     return None
 
 
+def _extract_label_from_vworld_json(data):
+    # result[0].text 가 가장 흔함
+    try:
+        rs = data.get("response", {}).get("result", [])
+        if rs and isinstance(rs, list):
+            txt = rs[0].get("text")
+            if isinstance(txt, str) and txt.strip():
+                return txt.strip()
+    except Exception:
+        pass
+    return ""
+
+
 def vworld_reverse_geocode(lat: float, lon: float):
     if not VWORLD_KEY:
-        return None, "VWORLD_KEY 없음"
+        return None, "VWORLD_KEY 없음", ""
     url = "https://api.vworld.kr/req/address"
     base_params = {
         "service": "address",
@@ -118,6 +130,7 @@ def vworld_reverse_geocode(lat: float, lon: float):
     }
 
     last_hint = ""
+    last_label = ""
     for tp in ("PARCEL", "BOTH", "ROAD"):
         params = dict(base_params)
         params["type"] = tp
@@ -125,8 +138,7 @@ def vworld_reverse_geocode(lat: float, lon: float):
             try:
                 r = _session.get(url, params=params, headers=DEFAULT_HEADERS, timeout=12)
             except Exception as e:
-                # 여기서 터지면 Streamlit이 빨간 화면으로 죽을 수 있으니 반드시 잡아서 힌트로 반환
-                return None, f"VWorld 연결 실패({type(e).__name__}): {mask_secret(repr(e))}"
+                return None, f"VWorld 연결 실패({type(e).__name__}): {mask_secret(repr(e))}", ""
 
             if r.status_code != 200:
                 last_hint = f"type={tp}, HTTP={r.status_code}"
@@ -145,23 +157,26 @@ def vworld_reverse_geocode(lat: float, lon: float):
             vw_msg = (data.get("response") or {}).get("message")
             last_hint = f"type={tp}, HTTP=200, vworld_status={vw_status}, msg={vw_msg}"
 
+            # 라벨은 OK/ERROR 관계없이 캐치 시도
+            last_label = _extract_label_from_vworld_json(data) or last_label
+
             if vw_status and str(vw_status).upper() != "OK":
                 break
 
             code = _extract_bjd_from_vworld_json(data)
             if code:
-                return code, last_hint
+                return code, last_hint, last_label
 
             if attempt == 0:
                 time.sleep(0.4)
 
-    return None, last_hint or "VWorld 응답에서 코드 추출 실패"
+    return None, last_hint or "VWorld 응답에서 코드 추출 실패", last_label
 
 
 def kakao_reverse_geocode(lat: float, lon: float):
-    """카카오 로컬 API: coord2regioncode → 법정동코드(10자리) (region_type=B)"""
+    """카카오 로컬 API: coord2regioncode → 법정동코드(10자리) (region_type=B) + 라벨(시/구/동)"""
     if not KAKAO_KEY:
-        return None, "KAKAO_REST_API_KEY 없음"
+        return None, "KAKAO_REST_API_KEY 없음", ""
 
     url = "https://dapi.kakao.com/v2/local/geo/coord2regioncode.json"
     params = {"x": str(lon), "y": str(lat)}
@@ -171,46 +186,60 @@ def kakao_reverse_geocode(lat: float, lon: float):
     try:
         r = _session.get(url, params=params, headers=headers, timeout=12)
     except Exception as e:
-        return None, f"Kakao 연결 실패({type(e).__name__}): {mask_secret(repr(e))}"
+        return None, f"Kakao 연결 실패({type(e).__name__}): {mask_secret(repr(e))}", ""
 
     if r.status_code != 200:
-        return None, f"Kakao HTTP={r.status_code}"
+        return None, f"Kakao HTTP={r.status_code}", ""
 
     try:
         data = r.json()
     except Exception as e:
-        return None, f"Kakao JSON 파싱 실패: {type(e).__name__}"
+        return None, f"Kakao JSON 파싱 실패: {type(e).__name__}", ""
 
     docs = data.get("documents", []) if isinstance(data, dict) else []
+    picked = None
+
     # region_type: B(법정동) / H(행정동)
     for d in docs:
         if d.get("region_type") == "B":
             code = d.get("code")
             if isinstance(code, str) and re.fullmatch(r"\d{10}", code):
-                return code, "Kakao OK(region_type=B)"
-    # 백업: 첫 번째 코드라도 사용 (드물게 region_type이 다르게 올 수도 있어서)
-    if docs:
-        code = docs[0].get("code")
+                picked = d
+                break
+
+    if not picked and docs:
+        picked = docs[0]
+
+    if picked:
+        code = picked.get("code")
+        # 라벨 조합
+        r1 = (picked.get("region_1depth_name") or "").strip()
+        r2 = (picked.get("region_2depth_name") or "").strip()
+        r3 = (picked.get("region_3depth_name") or "").strip()
+        label = " ".join([x for x in (r1, r2, r3) if x])
+
         if isinstance(code, str) and re.fullmatch(r"\d{10}", code):
-            return code, "Kakao OK(fallback)"
-    return None, "Kakao 응답에서 코드 없음"
+            rt = picked.get("region_type")
+            return code, f"Kakao OK(region_type={rt})", label
+
+    return None, "Kakao 응답에서 코드 없음", ""
 
 
 def resolve_bjd_code(lat: float, lon: float, provider: str):
-    """provider: auto | vworld | kakao"""
+    """provider: auto | vworld | kakao  -> (code, hint, label)"""
     if provider == "vworld":
         return vworld_reverse_geocode(lat, lon)
     if provider == "kakao":
         return kakao_reverse_geocode(lat, lon)
 
     # auto
-    code, hint = vworld_reverse_geocode(lat, lon)
+    code, hint, label = vworld_reverse_geocode(lat, lon)
     if code:
-        return code, f"[AUTO] {hint}"
-    code2, hint2 = kakao_reverse_geocode(lat, lon)
+        return code, f"[AUTO] {hint}", label
+    code2, hint2, label2 = kakao_reverse_geocode(lat, lon)
     if code2:
-        return code2, f"[AUTO] {hint2}"
-    return None, f"[AUTO] 실패: VWorld={hint} / Kakao={hint2}"
+        return code2, f"[AUTO] {hint2}", label2
+    return None, f"[AUTO] 실패: VWorld={hint} / Kakao={hint2}", label or label2
 
 
 # --- Sidebar UI ---
@@ -234,8 +263,6 @@ with st.sidebar:
     provider = st.selectbox("자동추적 제공자", ["auto", "vworld", "kakao"], index=0)
     show_debug = st.toggle("디버그(오류 상세 보기)", value=False)
 
-    st.caption("※ Streamlit Cloud에서 VWorld가 연결 에러가 나는 경우가 있어, Kakao 대안을 추가했습니다.")
-
     test_btn = st.button("연결 테스트(서울시청)")
 
 # --- 상태값 ---
@@ -244,13 +271,14 @@ st.session_state.setdefault("lon", DEFAULT_CENTER[1])
 st.session_state.setdefault("lawd10", "")
 st.session_state.setdefault("last_latlon", None)
 st.session_state.setdefault("last_hint", "")
+st.session_state.setdefault("last_label", "")
 
 # --- 연결 테스트 ---
 if test_btn:
     t_lat, t_lon = 37.5665, 126.9780
-    code, hint = resolve_bjd_code(t_lat, t_lon, provider=provider)
+    code, hint, label = resolve_bjd_code(t_lat, t_lon, provider=provider)
     if code:
-        st.success(f"테스트 성공: {code}  /  {mask_secret(hint)}")
+        st.success(f"테스트 성공: {code}  /  {label or '-'}  /  {mask_secret(hint)}")
     else:
         st.error(f"테스트 실패: {mask_secret(hint)}")
         if provider in ("auto", "vworld") and not VWORLD_KEY:
@@ -273,13 +301,19 @@ st.write("핀 좌표:", st.session_state.lat, st.session_state.lon)
 if auto_track:
     key = (round(st.session_state.lat, 6), round(st.session_state.lon, 6))
     if st.session_state.last_latlon != key:
-        code, hint = resolve_bjd_code(st.session_state.lat, st.session_state.lon, provider=provider)
+        code, hint, label = resolve_bjd_code(st.session_state.lat, st.session_state.lon, provider=provider)
         st.session_state.last_hint = hint or ""
+        st.session_state.last_label = label or ""
         if code:
             st.session_state.lawd10 = code
         else:
             st.warning("법정동코드 자동추적 실패(수동 입력 가능).")
         st.session_state.last_latlon = key
+
+# --- 표시: 동 이름(라벨) ---
+if st.session_state.get("last_label"):
+    st.subheader("선택 위치(법정동)")
+    st.info(st.session_state.last_label)
 
 if st.session_state.get("last_hint"):
     st.caption(f"자동추적 상태: {mask_secret(st.session_state.last_hint)}")
@@ -291,7 +325,7 @@ st.session_state.lawd10 = st.text_input("법정동코드 입력", value=st.sessi
 # --- 실거래 조회 ---
 def fetch_rtms(url: str, lawd5: str, ym: str) -> pd.DataFrame:
     params = {"serviceKey": SERVICE_KEY, "LAWD_CD": lawd5, "DEAL_YMD": ym, "numOfRows": 1000, "pageNo": 1}
-    r = _session.get(url, params=params, timeout=20)
+    r = _session.get(url, params=params, headers=DEFAULT_HEADERS, timeout=20)
     r.raise_for_status()
     root = ET.fromstring(r.text)
     return pd.DataFrame([{c.tag: c.text for c in list(it)} for it in root.findall(".//item")])
@@ -325,4 +359,4 @@ if st.button("실거래 조회"):
             st.success(f"총 {len(merged):,}건")
             st.dataframe(merged.head(200), use_container_width=True)
 
-st.caption("안정형 v8 – VWorld 연결 실패(Cloud) 대비: Kakao 대체 제공자 + 자동(AUTO) 폴백 + 앱 크래시 방지")
+st.caption("안정형 v9 – (요청사항 #1) 법정동명(시/구/동) 표시 + 기존 자동추적(AUTO/VWorld/Kakao) 유지")
