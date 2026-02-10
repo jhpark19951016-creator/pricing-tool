@@ -17,8 +17,9 @@ st.title("분양가 산정 Tool – 안정형")
 
 DEFAULT_CENTER = (37.5665, 126.9780)
 
-APT_URL = "https://apis.data.go.kr/1613000/RTMSDataSvcAptTradeDev/getRTMSDataSvcAptTradeDev"
-OFFI_URL = "https://apis.data.go.kr/1613000/RTMSDataSvcOffiTradeDev/getRTMSDataSvcOffiTradeDev"
+# ✅ v11: Dev 엔드포인트 -> 일반 엔드포인트(403 회피용)
+APT_URL = "https://apis.data.go.kr/1613000/RTMSDataSvcAptTrade/getRTMSDataSvcAptTrade"
+OFFI_URL = "https://apis.data.go.kr/1613000/RTMSDataSvcOffiTrade/getRTMSDataSvcOffiTrade"
 
 SERVICE_KEY_RAW = st.secrets.get("SERVICE_KEY", os.environ.get("SERVICE_KEY", "")).strip()
 VWORLD_KEY = st.secrets.get("VWORLD_KEY", os.environ.get("VWORLD_KEY", "")).strip()
@@ -45,7 +46,7 @@ if HTTPAdapter and Retry:
     _session.mount("https://", adapter)
     _session.mount("http://", adapter)
 
-DEFAULT_HEADERS = {"User-Agent": "pricing-tool/1.0 (streamlit)", "Accept": "application/json"}
+DEFAULT_HEADERS = {"User-Agent": "pricing-tool/1.1 (streamlit)", "Accept": "application/json"}
 
 
 def make_year_month_options(months: int = 72):
@@ -321,6 +322,7 @@ st.session_state.lawd10 = st.text_input("법정동코드 입력", value=st.sessi
 
 
 def parse_opendata_error(xml_text: str):
+    """공공데이터포털 오류 XML에서 resultCode/resultMsg 추출"""
     try:
         root = ET.fromstring(xml_text)
         code = root.findtext(".//resultCode")
@@ -379,7 +381,7 @@ if st.button("실거래 조회"):
             st.error("실거래 조회 중 오류가 발생했습니다.")
             st.code(mask_secret(str(e)))
             if show_debug:
-                st.caption("TIP) resultMsg에 'SERVICE KEY IS NOT REGISTERED' 또는 'INVALID'가 나오면 serviceKey 이중 인코딩 문제일 가능성이 큽니다.")
+                st.caption("TIP) 403이면 (1) 키/권한 (2) 엔드포인트 불일치 가능성이 큽니다. v11은 Dev->일반 엔드포인트로 교체했습니다.")
         else:
             merged = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
             if merged.empty:
@@ -388,4 +390,4 @@ if st.button("실거래 조회"):
                 st.success(f"총 {len(merged):,}건")
                 st.dataframe(merged.head(500), use_container_width=True)
 
-st.caption("안정형 v10 – (실거래 조회 안정화) serviceKey 이중 인코딩 방지 + 공공데이터포털 오류(resultCode/resultMsg) 표시")
+st.caption("안정형 v11 – Dev 엔드포인트 제거(403 회피) + serviceKey 이중 인코딩 방지 + 오류(resultCode/resultMsg) 표시")
