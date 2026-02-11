@@ -1,5 +1,5 @@
 streamlit
-pandas
 requests
-folium
+pandas
 streamlit-folium
+folium
