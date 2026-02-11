@@ -188,6 +188,7 @@ def vworld_reverse_geocode(lat: float, lon: float):
     return None, last_hint or "VWorld 응답에서 코드 추출 실패", last_label
 
 
+@st.cache_data(show_spinner=False, ttl=60*60*24)
 def kakao_reverse_geocode(lat: float, lon: float):
     if not KAKAO_KEY:
         return None, "KAKAO_REST_API_KEY 없음", ""
@@ -360,205 +361,180 @@ def _apply_query_params_to_session():
         except Exception:
             return False
 
-def render_map_folium(tile_mode: str = "kakao"):
+def render_map_folium(
+    center_lat: float,
+    center_lon: float,
+    zoom: int = 13,
+    tile_mode: str = "kakao",
+):
+    """Folium(Leaflet) 지도 렌더링.
+    - tile_mode="kakao": 카카오 타일을 **시도**하되, 타일 정책/차단/버전변경 등으로 실패할 수 있어
+      OSM(OpenStreetMap) 레이어를 함께 제공하여 '지도 빈 화면'을 방지합니다.
     """
-    tile_mode: "kakao" | "osm"
-    반환: out(dict) - st_folium 반환과 동일 형태 또는 {}.
-    """
-    m = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=13, tiles=None, control_scale=True)
 
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=zoom, control_scale=True)
+
+    # 1) 안정적인 기본(항상 표시) 레이어
+    folium.TileLayer(
+        tiles="OpenStreetMap",
+        name="OSM(대체/안정)",
+        control=True,
+        show=(tile_mode != "kakao"),
+    ).add_to(m)
+
+    # 2) 카카오 타일(실패 가능) 레이어
     if tile_mode == "kakao":
-        # Kakao(daum) 타일 (운영/권장)
-        KAKAO_TILES = "https://map.daumcdn.net/map_2d/2212qpe/L{z}/{y}/{x}.png"
+        # NOTE: 카카오 타일 URL은 비공식/변동 가능성이 있어, 동작 보장을 위해 OSM을 같이 둡니다.
+        kakao_tile = (
+            "https://map.daumcdn.net/map_2d/2212qpe/L{z}/{y}/{x}.png"
+        )
         folium.TileLayer(
-            tiles=KAKAO_TILES,
+            tiles=kakao_tile,
             attr="Kakao",
-            name="Kakao",
-            overlay=False,
-            control=False,
+            name="Kakao(타일/실험)",
+            control=True,
+            show=True,
             max_zoom=19,
-            min_zoom=1,
         ).add_to(m)
-    else:
-        # OSM(백업)
-        folium.TileLayer("OpenStreetMap", name="OSM", control=False).add_to(m)
 
-    folium.Marker([st.session_state.lat, st.session_state.lon], popup="선택 위치").add_to(m)
-    return st_folium(m, width=None, height=420)
+    folium.LayerControl(collapsed=True).add_to(m)
 
-def render_map_kakao_sdk_with_fallback():
-    """
-    Kakao JS SDK 지도(실험) + 실패해도 아래에 A(카카오 타일) 지도 표시.
-    - JS SDK는 브라우저에서만 동작하므로, 실패 여부를 파이썬이 100% 감지할 수 없습니다.
-      그래서 '항상' A를 아래에 같이 보여주고(B는 위), 사용자가 선택적으로 B만 쓸 수 있게 구성합니다.
-    """
-    if not KAKAO_JS_KEY:
-        st.warning("KAKAO_JAVASCRIPT_KEY가 없어 kakao(완전) 모드를 사용할 수 없습니다. 아래 A(카카오 타일) 지도를 사용하세요.")
-        return render_map_folium(tile_mode="kakao")
+    # 핀/마커
+    folium.Marker([center_lat, center_lon], tooltip="선택 위치").add_to(m)
 
-    applied = _apply_query_params_to_session()
-    if applied:
-        st.info("✅ 카카오 SDK 지도 클릭 좌표를 반영했습니다. (URL lat/lon)")
-
-    uid = int(time.time() * 1000)
-
-    # f-string은 JS 중괄호({}) 때문에 파서가 깨질 수 있어 템플릿 replace로 생성합니다.
-    kakao_html_tpl = """<div id="kakao_status___UID__" style="font-size:12px;color:#666;margin-bottom:6px;">카카오 SDK 로딩 준비...</div>
-<div id="kakao_map___UID__" style="width:100%;height:420px;border-radius:8px;"></div>
-
-<script>
-(function(){
-  const uid = "__UID__";
-  const statusEl = document.getElementById("kakao_status___UID__");
-  const mapEl = document.getElementById("kakao_map___UID__");
-
-  function setStatus(msg, isErr){
-    if(!statusEl) return;
-    statusEl.textContent = msg;
-    statusEl.style.color = isErr ? "#c62828" : "#666";
-  }
-
-  function updateParentUrl(lat, lon){
-    try{
-      const u = new URL(window.parent.location.href);
-      u.searchParams.set("lat", String(lat));
-      u.searchParams.set("lon", String(lon));
-      // Streamlit이 URL 변경을 감지하도록 전체 리로드 (가장 확실)
-      window.parent.location.replace(u.toString());
-    }catch(e){}
-  }
-
-  setStatus("카카오 SDK 로딩 중...");
-
-  // SDK 로드 (반드시 appkey 파라미터 필요)
-  const sdk = document.createElement("script");
-  sdk.type = "text/javascript";
-  sdk.src = "https://dapi.kakao.com/v2/maps/sdk.js?appkey=__APPKEY__&libraries=services&autoload=false";
-  sdk.async = true;
-
-  sdk.onerror = function(){
-    setStatus("❌ 카카오 SDK 로드 실패 (도메인 등록/키/차단 확인 필요). 아래 타일 지도(A)를 사용하세요.", true);
-  };
-
-  document.head.appendChild(sdk);
-
-  let startedAt = Date.now();
-  let mapObj = null;
-  let marker = null;
-
-  function initMap(){
-    if(mapObj) return;
-    if(!mapEl){
-      setStatus("❌ 지도 컨테이너를 찾을 수 없습니다", true);
-      return;
-    }
-
-    const lat = parseFloat("__LAT__");
-    const lon = parseFloat("__LON__");
-    const center = new kakao.maps.LatLng(lat, lon);
-    mapObj = new kakao.maps.Map(mapEl, { center: center, level: 6 });
-    marker = new kakao.maps.Marker({ position: center });
-    marker.setMap(mapObj);
-
-    kakao.maps.event.addListener(mapObj, "click", function(mouseEvent){
-      try{
-        const ll = mouseEvent.latLng;
-        marker.setPosition(ll);
-        setStatus("✅ 클릭 좌표 반영중... " + ll.getLat().toFixed(6) + ", " + ll.getLng().toFixed(6));
-        updateParentUrl(ll.getLat(), ll.getLng());
-      }catch(e){
-        setStatus("❌ 클릭 이벤트 처리 오류: " + (e && e.message ? e.message : e), true);
-      }
-    });
-
-    setStatus("✅ 카카오 SDK 지도 로딩 완료");
-  }
-
-  const timer = setInterval(function(){
-    const loaded = (typeof kakao !== "undefined");
-    if(loaded && kakao.maps && kakao.maps.load){
-      clearInterval(timer);
-      try{
-        kakao.maps.load(function(){
-          try{ initMap(); }catch(e){
-            setStatus("❌ 지도 초기화 예외: " + (e && e.message ? e.message : e), true);
-          }
-        });
-      }catch(e){
-        setStatus("❌ kakao.maps.load 호출 실패: " + (e && e.message ? e.message : e), true);
-      }
-      return;
-    }
-
-    const elapsed = Date.now() - startedAt;
-    if(elapsed > 8000){
-      clearInterval(timer);
-      setStatus("❌ kakao 객체가 준비되지 않습니다. (JS SDK 도메인 미등록/키 제한/확장프로그램/사내망 차단 가능) 개발자도구 Console 확인 필요. 아래 타일 지도(A)를 사용하세요.", true);
-    }
-  }, 250);
-})();
-</script>
-"""
-
-    kakao_html = (
-        kakao_html_tpl
-        .replace("__APPKEY__", KAKAO_JS_KEY)
-        .replace("__LAT__", f"{st.session_state.lat}")
-        .replace("__LON__", f"{st.session_state.lon}")
-        .replace("__UID__", str(uid))
+    # Leaflet 클릭 이벤트 -> Streamlit 반환
+    return st_folium(
+        m,
+        width=None,
+        height=470,
+        returned_objects=["last_clicked", "bounds", "center", "zoom"],
+        key=f"folium_map_{tile_mode}",
     )
 
-    # B(실험) 지도
-    components.html(kakao_html, height=470)
+def render_map_kakao_sdk_with_fallback(
+    center_lat: float,
+    center_lon: float,
+    zoom: int = 3,
+    height: int = 470,
+):
+    """카카오 JS SDK 지도(실험) + Folium 대체지도(항상 표시).
+    JS SDK는 '도메인 등록/광고차단/사내망 보안' 이슈로 로드가 안 되는 경우가 많아서,
+    아래에 Folium 지도를 항상 같이 보여줍니다.
+    """
 
-    # A(운영) 지도 fallback (항상 보여주기)
-    st.caption("⬇️ 아래 지도는 **안정형(A: 카카오 타일)** 입니다. 위 SDK 지도가 안 뜨면 아래 지도로 계속 진행하세요.")
-    return render_map_folium(tile_mode="kakao")
+    js_key = (KAKAO_JAVASCRIPT_KEY or "").strip()
+    if not js_key:
+        st.error("KAKAO_JAVASCRIPT_KEY(카카오 JavaScript 키)가 설정되지 않아 JS-SDK 지도를 표시할 수 없습니다.")
+        st.info("Streamlit Cloud → App → Settings → Secrets 에 KAKAO_JAVASCRIPT_KEY 를 추가하세요.")
+        return
 
-# 렌더링 분기
-use_kakao_js = map_mode.startswith("kakao(완전")
-if use_kakao_js:
-    out = render_map_kakao_sdk_with_fallback()
-elif map_mode.startswith("folium(OSM"):
-    out = render_map_folium(tile_mode="osm")
-else:
-    # 기본 A
-    out = render_map_folium(tile_mode="kakao")
+    kakao_html = f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  html, body {{ height: 100%; margin: 0; padding: 0; }}
+  #wrap {{ position: relative; width: 100%; height: 100%; }}
+  #map {{ width: 100%; height: 100%; background: #f4f6f8; }}
+  #overlay {{
+    position: absolute; top: 10px; left: 10px; right: 10px;
+    padding: 10px 12px;
+    font: 13px/1.45 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Noto Sans KR',sans-serif;
+    background: rgba(255,255,255,0.92);
+    border: 1px solid rgba(0,0,0,0.08);
+    border-radius: 10px;
+    box-shadow: 0 6px 18px rgba(0,0,0,0.08);
+  }}
+  #overlay .ok {{ color: #0a7a2f; font-weight: 700; }}
+  #overlay .bad {{ color: #b42318; font-weight: 700; }}
+  #overlay code {{ background: #f6f6f6; padding: 2px 6px; border-radius: 6px; }}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="map"></div>
+  <div id="overlay">카카오 JS SDK 로딩 중…</div>
+</div>
 
-# folium 엔진일 때만 last_clicked로 좌표 갱신
-try:
-    if isinstance(out, dict) and out.get("last_clicked"):
-        st.session_state.lat = out["last_clicked"]["lat"]
-        st.session_state.lon = out["last_clicked"]["lng"]
-except Exception:
-    pass
+<script>
+(function() {{
+  var overlay = document.getElementById('overlay');
+  var initialized = false;
 
-st.write("핀 좌표:", st.session_state.lat, st.session_state.lon)
+  function setHtml(html) {{
+    overlay.innerHTML = html;
+  }}
 
-# --- 자동추적 ---
-if auto_track:
-    key = (round(st.session_state.lat, 6), round(st.session_state.lon, 6))
-    if st.session_state.last_latlon != key:
-        code, hint, label = resolve_bjd_code(st.session_state.lat, st.session_state.lon, provider=provider)
-        st.session_state.last_hint = hint or ""
-        st.session_state.last_label = label or ""
-        if code:
-            st.session_state.lawd10 = code
-        else:
-            st.warning("법정동코드 자동추적 실패(수동 입력 가능).")
-        st.session_state.last_latlon = key
+  function showGuide(reason) {{
+    var ref = document.referrer || '(empty)';
+    // Kakao 콘솔에 등록해야 하는 도메인은 "프로토콜 + 도메인"만(경로 제외)
+    var base = ref.split('/').slice(0, 3).join('/');
+    setHtml(
+      '<span class="bad">✕ Kakao SDK 초기화 실패</span><br/>' +
+      '<b>사유:</b> ' + reason + '<br/><br/>' +
+      '<b>1) Kakao Developers → 내 애플리케이션 → 앱 설정 → 플랫폼 → Web</b> 에서<br/>' +
+      '<b>JavaScript SDK 도메인</b>에 아래 값을 추가하세요(프로토콜 포함, 경로 제외):<br/>' +
+      '<code>' + base + '</code><br/>' +
+      '(현재 Referrer: <code>' + ref + '</code>)<br/><br/>' +
+      '<b>2) 광고차단/보안SW/사내망 장비</b>가 <code>dapi.kakao.com</code>을 차단하면 로드가 안 됩니다.'
+    );
+  }}
 
-# --- 표시: 동 이름 ---
-if st.session_state.get("last_label"):
-    st.subheader("선택 위치(법정동)")
-    st.info(st.session_state.last_label)
+  function initMap() {{
+    try {{
+      if (!window.kakao || !kakao.maps) {{
+        showGuide('kakao.maps 객체가 없습니다(스크립트 로드 실패/차단).');
+        return;
+      }}
 
-if st.session_state.get("last_hint"):
-    st.caption(f"자동추적 상태: {mask_secret(st.session_state.last_hint)}")
+      var container = document.getElementById('map');
+      var options = {{
+        center: new kakao.maps.LatLng({{center_lat}}, {{center_lon}}),
+        level: {{zoom}}
+      }};
+      var map = new kakao.maps.Map(container, options);
 
-st.subheader("법정동코드(10자리)")
-st.session_state.lawd10 = st.text_input("법정동코드 입력", value=st.session_state.lawd10)
+      var markerPosition  = new kakao.maps.LatLng({{center_lat}}, {{center_lon}});
+      var marker = new kakao.maps.Marker({{ position: markerPosition }});
+      marker.setMap(map);
 
+      initialized = true;
+      setHtml('<span class="ok">✓ Kakao 지도 로드 완료</span>');
+    }} catch (e) {{
+      showGuide('예외: ' + (e && e.message ? e.message : e));
+    }}
+  }}
+
+  // SDK 로드(autoload=true). onload에서 바로 init.
+  var script = document.createElement('script');
+  script.src = 'https://dapi.kakao.com/v2/maps/sdk.js?appkey={{js_key}}&autoload=true';
+  script.async = true;
+
+  script.onload = function() {{
+    initMap();
+  }};
+  script.onerror = function() {{
+    showGuide('SDK 스크립트 로드 실패(onerror). 네트워크/차단 여부를 확인하세요.');
+  }};
+
+  document.head.appendChild(script);
+
+  // 6초 타임아웃 가드
+  setTimeout(function() {{
+    if (!initialized) {{
+      showGuide('6초 동안 로드되지 않았습니다(도메인 미등록/차단 가능).');
+    }}
+  }}, 6000);
+}})();
+</script>
+</body>
+</html>""".format(center_lat=center_lat, center_lon=center_lon, zoom=zoom, js_key=js_key)
+
+    components.html(kakao_html, height=height, scrolling=False)
+
+    st.caption("⬇︎ (대체지도) JS-SDK가 막히는 환경이 있어 아래 Folium 지도를 항상 같이 제공합니다.")
+    render_map_folium(center_lat, center_lon, zoom=13, tile_mode="kakao")
 
 def parse_opendata_error(xml_text: str):
     """공공데이터포털 오류 XML에서 resultCode/resultMsg 추출"""
