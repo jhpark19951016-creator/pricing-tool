@@ -240,11 +240,17 @@ def render_map_leaflet(lat: float, lon: float, zoom: int = 14, height: int = 470
     data = st_folium(m, height=height, width=None)
     return data, "Leaflet OK"
 
-def render_map_kakao_js(lat: float, lon: float, js_key: str, height: int = 470) -> str:
+def render_map_kakao_js(lat: float, lon: float, js_key: str, height: int = 470, zoom_level: int = 6) -> str:
     """
     Kakao JS-SDK 지도 (iframe 내) 렌더링.
     - 클릭 시 window.top.location 을 갱신하여 Streamlit 앱 전체를 새로고침하면서 lat/lon 쿼리 파라미터를 전달.
     """
+    # Kakao map 'level' is inverse of typical zoom: 1(가까움) ~ 14(멀리)
+    try:
+        zoom_level = int(zoom_level)
+    except Exception:
+        zoom_level = 6
+    zoom_level = max(1, min(14, zoom_level))
     if not js_key:
         return "KAKAO_JAVASCRIPT_KEY가 없습니다."
 
