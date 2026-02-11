@@ -464,7 +464,8 @@ def render_map_kakao_js(lat: float, lon: float, js_key: str, height: int = 520, 
 </html>
 """.format(height=height, lat=lat, lon=lon, zoom_level=zoom_level, sdk_url=sdk_url)
 
-    return template
+    components.html(template, height=height+20, scrolling=False)
+    return 'Kakao JS OK(렌더링 시도)'
 
 st.set_page_config(page_title=f"분양가 산정 Tool - 안정형 {APP_VERSION}", layout="wide")
 
