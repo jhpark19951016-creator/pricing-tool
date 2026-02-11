@@ -28,7 +28,7 @@ except Exception:
 
 import streamlit.components.v1 as components
 
-APP_VERSION = "v14.7"
+APP_VERSION = "v14.8"
 
 # -----------------------------
 # 공통 유틸
@@ -281,7 +281,7 @@ def render_map_kakao_js(lat: float, lon: float, js_key: str, height: int = 470, 
       <div class="title">Kakao JS-SDK 상태</div>
       <div class="row" id="s1">1) SDK 로드 준비...</div>
       <div class="row" id="s2">2) kakao 객체 확인 대기...</div>
-      <div class="row" id="s3">3) kakao.maps.load 콜백 대기...</div>
+      <div class="row" id="s3">3) SDK 내부 준비 대기...</div>
       <div class="row" id="s4">4) 지도 생성 대기...</div>
       <div class="row" id="err" style="color:#b91c1c; display:none;"></div>
       <div class="row" style="color:#6b7280; margin-top:6px;">
@@ -302,26 +302,48 @@ def render_map_kakao_js(lat: float, lon: float, js_key: str, height: int = 470, 
         setText('s1', '1) SDK 로딩 중...');
         const s=document.createElement('script');
         s.async=true;
-        s.src='https://dapi.kakao.com/v2/maps/sdk.js?appkey=__JS_KEY__&autoload=false';
+        // autoload=false + kakao.maps.load() 가 특정 환경(iframe/sandbox/확장프로그램)에서
+        // 콜백이 영원히 대기하는 사례가 있어, 더 안전한 "폴링(대기 후 초기화)" 방식으로 구현합니다.
+        s.src='https://dapi.kakao.com/v2/maps/sdk.js?appkey=__JS_KEY__&autoload=true';
         s.onerror=function(){ setText('s1','1) SDK 로드 실패'); setErr('SDK 스크립트를 불러오지 못했습니다(네트워크/차단/키).'); };
         s.onload=function(){
           setText('s1','1) SDK 로드 완료');
           if(!window.kakao){ setText('s2','2) kakao 객체 없음'); setErr('SDK는 로드됐지만 window.kakao가 없습니다. 확장프로그램/정책 차단 가능'); return; }
           setText('s2','2) kakao 객체 OK');
-          try{
-            setText('s3','3) kakao.maps.load 호출');
-            window.kakao.maps.load(function(){
-              setText('s3','3) kakao.maps.load 콜백 실행됨');
+
+          // kakao.maps 네임스페이스가 준비될 때까지 짧게 폴링 후 초기화
+          let tries = 0;
+          const maxTries = 80;   // 약 8초 (100ms * 80)
+          const tickMs = 100;
+          setText('s3', '3) SDK 내부 준비 대기(0/' + maxTries + ')');
+          const t = setInterval(function(){
+            tries += 1;
+            try{
+              const ok = window.kakao && window.kakao.maps && window.kakao.maps.Map && window.kakao.maps.LatLng;
+              setText('s3', '3) SDK 내부 준비 대기(' + tries + '/' + maxTries + ')');
+              if(!ok){
+                if(tries >= maxTries){
+                  clearInterval(t);
+                  setErr('SDK 로드는 됐지만 maps 객체가 준비되지 않았습니다(차단/환경 이슈 가능).');
+                }
+                return;
+              }
+              clearInterval(t);
               try{
                 const container = document.getElementById('map');
                 const options = { center: new kakao.maps.LatLng(LAT, LON), level: LEVEL };
                 const map = new kakao.maps.Map(container, options);
                 const marker = new kakao.maps.Marker({ position: new kakao.maps.LatLng(LAT, LON) });
                 marker.setMap(map);
+                // iframe/레이아웃 환경에서 초기 렌더가 안 보이는 경우가 있어 relayout을 한 번 더 호출
+                setTimeout(function(){ try{ map.relayout(); map.setCenter(new kakao.maps.LatLng(LAT, LON)); }catch(e){} }, 0);
+                setText('s3','3) SDK 준비 완료');
                 setText('s4','4) 지도 생성 완료');
               }catch(e){ setText('s4','4) 지도 생성 실패'); setErr(String(e)); }
-            });
-          }catch(e){ setText('s3','3) kakao.maps.load 호출 실패'); setErr(String(e)); }
+            }catch(e){
+              if(tries >= maxTries){ clearInterval(t); setErr(String(e)); }
+            }
+          }, tickMs);
         };
         document.head.appendChild(s);
       }catch(e){ setErr(String(e)); }
