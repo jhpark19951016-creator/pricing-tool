@@ -339,7 +339,7 @@ if map_mode.startswith("kakao"):
 
   var script = document.createElement("script");
   script.type = "text/javascript";
-  script.src = "https://dapi.kakao.com/v2/maps/sdk.js?appkey={KAKAO_JS_KEY}&autoload=false";
+  script.src = "https://dapi.kakao.com/v2/maps/sdk.js?appkey={KAKAO_JS_KEY}";
   script.onerror = function() {{
     setStatus("❌ 카카오 SDK 로드 실패 (도메인 등록/키/광고차단 확장프로그램 확인)");
   }};
@@ -347,43 +347,62 @@ if map_mode.startswith("kakao"):
 
   var tries = 0;
   var started = false;
+  var loadCallbackFired = false;
+  var mapReady = false;
 
   function start() {{
     if (started) return;
     started = true;
 
-    try {{
-      kakao.maps.load(function() {{
-        try {{
-          var container = document.getElementById("kakao_map_{uid}");
-          if (!container) {{
-            setStatus("❌ 지도 컨테이너를 찾을 수 없습니다");
-            return;
+    function bindClick(map) {{
+      try {{
+        kakao.maps.event.addListener(map, "click", function(mouseEvent) {{
+          var latlng = mouseEvent.latLng;
+          var lat = latlng.getLat();
+          var lon = latlng.getLng();
+          try {{
+            var url = new URL(window.parent.location.href);
+            url.searchParams.set("lat", lat.toFixed(8));
+            url.searchParams.set("lon", lon.toFixed(8));
+            window.parent.location.href = url.toString();
+          }} catch (e) {{
+            console.log(e);
           }}
-          var center = new kakao.maps.LatLng({st.session_state.lat}, {st.session_state.lon});
-          var map = new kakao.maps.Map(container, {{ center: center, level: 4 }});
-          var marker = new kakao.maps.Marker({{ position: center }});
-          marker.setMap(map);
+        }});
+      }} catch (e) {{}}
+    }}
 
-          kakao.maps.event.addListener(map, "click", function(mouseEvent) {{
-            var latlng = mouseEvent.latLng;
-            var lat = latlng.getLat();
-            var lon = latlng.getLng();
-            try {{
-              var url = new URL(window.parent.location.href);
-              url.searchParams.set("lat", lat.toFixed(8));
-              url.searchParams.set("lon", lon.toFixed(8));
-              window.parent.location.href = url.toString();
-            }} catch (e) {{
-              console.log(e);
-            }}
-          }});
+    function createMap() {{
+      var container = document.getElementById("kakao_map_{uid}");
+      if (!container) {{
+        setStatus("❌ 지도 컨테이너를 찾을 수 없습니다");
+        return;
+      }}
+      var center = new kakao.maps.LatLng({st.session_state.lat}, {st.session_state.lon});
+      var map = new kakao.maps.Map(container, {{ center: center, level: 4 }});
+      var marker = new kakao.maps.Marker({{ position: center }});
+      marker.setMap(map);
+      mapReady = true;
+      bindClick(map);
+      setStatus("✅ 카카오맵 로딩 완료 (지도를 클릭하면 핀이 이동합니다)");
+    }}
 
-          setStatus("✅ 카카오맵 로딩 완료 (지도를 클릭하면 핀이 이동합니다)");
-        }} catch (e) {{
-          setStatus("❌ 지도 생성 예외: " + (e && e.message ? e.message : e));
-        }}
-      }});
+    try {{
+      if (kakao.maps && typeof kakao.maps.load === "function") {{
+        setStatus("카카오 SDK 로드됨. 지도 초기화 중...");
+        kakao.maps.load(function() {{
+          loadCallbackFired = true;
+          try {{
+            createMap();
+          }} catch (e) {{
+            setStatus("❌ 지도 생성 예외: " + (e && e.message ? e.message : e));
+          }}
+        }});
+      }} else {{
+        // autoload=true 환경(혹은 load 함수 미제공) 대응
+        loadCallbackFired = true;
+        createMap();
+      }}
     }} catch (e) {{
       setStatus("❌ 초기화 예외: " + (e && e.message ? e.message : e));
     }}
@@ -399,6 +418,17 @@ if map_mode.startswith("kakao"):
     if (typeof kakao !== "undefined" && kakao.maps && typeof kakao.maps.load === "function") {{
       setStatus("카카오 SDK 로드됨. 지도 초기화 중...");
       start();
+      // load 콜백/지도생성 워치독
+      setTimeout(function(){
+        if (started && !loadCallbackFired) {
+          setStatus("❌ kakao.maps.load 콜백이 실행되지 않습니다. (JS SDK 도메인 미등록/키 제한/사내망 차단 가능) - 브라우저 개발자도구 Console 확인 필요");
+        }
+      }, 6000);
+      setTimeout(function(){
+        if (started && loadCallbackFired && !mapReady) {
+          setStatus("❌ 지도 생성이 완료되지 않았습니다. (JS SDK 도메인 등록/키 확인, 광고차단/보안 확장프로그램, 사내망 dapi.kakao.com 차단 여부 확인)");
+        }
+      }, 9000);
       return;
     }}
 
