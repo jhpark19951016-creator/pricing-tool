@@ -28,7 +28,7 @@ except Exception:
 
 import streamlit.components.v1 as components
 
-APP_VERSION = "v14.6"
+APP_VERSION = "v14.7"
 
 # -----------------------------
 # 공통 유틸
@@ -248,77 +248,87 @@ def render_map_kakao_js(lat: float, lon: float, js_key: str, height: int = 470) 
     if not js_key:
         return "KAKAO_JAVASCRIPT_KEY가 없습니다."
 
-    # top navigation 방식은 브라우저/보안 설정에 따라 막힐 수 있음 → 안내 문구 포함
-    html = f"""
+    # Kakao JS SDK 지도(iframe) 렌더링
+    # JS SDK를 iframe 안에서 로드할 때, 실패해도(도메인 미등록/광고차단/사내망 등)
+    # 화면이 빈 상태로 남지 않도록 iframe 내부에 단계/에러를 표시합니다.
+    template = r"""
 <!doctype html>
 <html>
 <head>
-<meta charset="utf-8" />
-<style>
-  html, body, #map {{ width:100%; height:100%; margin:0; padding:0; }}
-  .hint {{ position:absolute; top:8px; left:8px; z-index:10;
-           background:rgba(255,255,255,0.9); padding:6px 8px; border-radius:8px;
-           font-family:system-ui, -apple-system, Segoe UI, Roboto, sans-serif; font-size:12px; }}
-</style>
-<script src="https://dapi.kakao.com/v2/maps/sdk.js?appkey={js_key}&autoload=false"></script>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    html, body { width:100%; height:100%; margin:0; padding:0; }
+    #wrap { width:100%; height:100%; position:relative; font-family:system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    #map { width:100%; height:100%; background:#f3f4f6; }
+    #status { position:absolute; left:8px; top:8px; z-index:9999; background:rgba(255,255,255,0.92);
+             border:1px solid #e5e7eb; padding:8px 10px; border-radius:8px; max-width:92%; font-size:12px; line-height:1.35; }
+    #status .title { font-weight:700; margin-bottom:4px; }
+    #status .row { margin:2px 0; }
+    #status code { background:#f9fafb; padding:1px 4px; border-radius:4px; }
+  </style>
 </head>
 <body>
-<div id="map"></div>
-<div class="hint">지도 클릭 → 좌표를 앱에 전달합니다(페이지가 한 번 새로고침됩니다).</div>
-<script>
-(function() {{
-  function boot() {{
-    if (!window.kakao || !window.kakao.maps) {{
-      document.body.innerHTML = '<div style="font-family:system-ui;padding:12px;color:#b00020;">kakao 객체가 준비되지 않았습니다. (JS SDK 도메인/키/차단 여부 확인 필요)</div>';
-      return;
-    }}
-    kakao.maps.load(function() {{
-      var container = document.getElementById('map');
-      var options = {{
-        center: new kakao.maps.LatLng({lat}, {lon}),
-        level: 4
-      }};
-      var map = new kakao.maps.Map(container, options);
-      var marker = new kakao.maps.Marker({{ position: map.getCenter() }});
-      marker.setMap(map);
-
-      kakao.maps.event.addListener(map, 'click', function(mouseEvent) {{
-        var ll = mouseEvent.latLng;
-        var newLat = ll.getLat();
-        var newLng = ll.getLng();
-        marker.setPosition(ll);
-
-        try {{
-          var topUrl = new URL(window.top.location.href);
-          topUrl.searchParams.set('lat', newLat.toFixed(10));
-          topUrl.searchParams.set('lon', newLng.toFixed(10));
-          topUrl.searchParams.set('src', 'kakao');
-          window.top.location.href = topUrl.toString();
-        }} catch (e) {{
-          // 일부 환경에서 top navigation이 막힐 수 있음
-          alert('좌표 전달(상위 페이지 이동)이 차단되었습니다. Leaflet 모드로 전환하거나 브라우저 Console 오류를 확인해주세요.');
-        }}
-      }});
-    }});
-  }}
-  // SDK가 느리게 로드되는 경우 대비
-  var tries = 0;
-  var t = setInterval(function() {{
-    tries++;
-    if (window.kakao && window.kakao.maps) {{
-      clearInterval(t);
-      boot();
-    }}
-    if (tries > 40) {{
-      clearInterval(t);
-      document.body.innerHTML = '<div style="font-family:system-ui;padding:12px;color:#b00020;">Kakao SDK 로딩 시간이 초과되었습니다. 네트워크/차단(사내망)/도메인 등록을 확인하세요.</div>';
-    }}
-  }}, 150);
-}})();
-</script>
+  <div id="wrap">
+    <div id="map"></div>
+    <div id="status">
+      <div class="title">Kakao JS-SDK 상태</div>
+      <div class="row" id="s1">1) SDK 로드 준비...</div>
+      <div class="row" id="s2">2) kakao 객체 확인 대기...</div>
+      <div class="row" id="s3">3) kakao.maps.load 콜백 대기...</div>
+      <div class="row" id="s4">4) 지도 생성 대기...</div>
+      <div class="row" id="err" style="color:#b91c1c; display:none;"></div>
+      <div class="row" style="color:#6b7280; margin-top:6px;">
+        안 뜨면: (1) <code>JavaScript SDK 도메인</code>에 현재 URL(https 포함) 등록
+        (2) JS 키 사용, (3) 광고차단/사내망 차단 확인
+      </div>
+    </div>
+  </div>
+  <script>
+    const LAT = __LAT__;
+    const LON = __LON__;
+    const LEVEL = __LEVEL__;
+    function setText(id, txt){ const el=document.getElementById(id); if(el) el.textContent = txt; }
+    function setErr(msg){ const el=document.getElementById('err'); if(el){ el.style.display='block'; el.textContent = '오류: ' + msg; } }
+    // SDK 동적 로드 (onerror를 잡기 위함)
+    (function(){
+      try{
+        setText('s1', '1) SDK 로딩 중...');
+        const s=document.createElement('script');
+        s.async=true;
+        s.src='https://dapi.kakao.com/v2/maps/sdk.js?appkey=__JS_KEY__&autoload=false';
+        s.onerror=function(){ setText('s1','1) SDK 로드 실패'); setErr('SDK 스크립트를 불러오지 못했습니다(네트워크/차단/키).'); };
+        s.onload=function(){
+          setText('s1','1) SDK 로드 완료');
+          if(!window.kakao){ setText('s2','2) kakao 객체 없음'); setErr('SDK는 로드됐지만 window.kakao가 없습니다. 확장프로그램/정책 차단 가능'); return; }
+          setText('s2','2) kakao 객체 OK');
+          try{
+            setText('s3','3) kakao.maps.load 호출');
+            window.kakao.maps.load(function(){
+              setText('s3','3) kakao.maps.load 콜백 실행됨');
+              try{
+                const container = document.getElementById('map');
+                const options = { center: new kakao.maps.LatLng(LAT, LON), level: LEVEL };
+                const map = new kakao.maps.Map(container, options);
+                const marker = new kakao.maps.Marker({ position: new kakao.maps.LatLng(LAT, LON) });
+                marker.setMap(map);
+                setText('s4','4) 지도 생성 완료');
+              }catch(e){ setText('s4','4) 지도 생성 실패'); setErr(String(e)); }
+            });
+          }catch(e){ setText('s3','3) kakao.maps.load 호출 실패'); setErr(String(e)); }
+        };
+        document.head.appendChild(s);
+      }catch(e){ setErr(String(e)); }
+    })();
+  </script>
 </body>
 </html>
 """
+    html = (template
+            .replace('__JS_KEY__', js_key)
+            .replace('__LAT__', f'{lat:.8f}')
+            .replace('__LON__', f'{lon:.8f}')
+            .replace('__LEVEL__', str(int(zoom_level))))
     components.html(html, height=height)
     return "Kakao JS OK(렌더링 시도)"
 
