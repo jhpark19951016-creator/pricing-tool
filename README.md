@@ -23,3 +23,14 @@ KAKAO_REST_API_KEY = "카카오 REST API 키"
 ## v13 변경사항 (1단계)
 - Folium 엔진은 유지하고 **배경지도를 카카오(daum) 타일**로 교체(기존 기능 영향 없음)
 - 다음 단계(v14)에서 카카오 JS SDK 기반으로 지도 입력부를 완전 교체 예정
+
+
+## v14 변경사항 (완전 카카오맵)
+- Kakao JS SDK로 지도 렌더링하는 **kakao(완전)** 모드 추가
+- 클릭 좌표를 `?lat=...&lon=...` query param으로 전달하여 Streamlit(Python) 세션에 반영(리로드 방식)
+- 안전을 위해 **folium(대체)** 모드 유지(기존 방식 그대로)
+
+### Secrets 추가(필수)
+```toml
+KAKAO_JAVASCRIPT_KEY = "카카오 JavaScript 키"
+```

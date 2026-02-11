@@ -2,6 +2,7 @@
 import os, re, json, datetime as dt, time
 from urllib.parse import unquote
 import pandas as pd, requests, streamlit as st, folium
+import streamlit.components.v1 as components
 from streamlit_folium import st_folium
 import xml.etree.ElementTree as ET
 
@@ -28,6 +29,13 @@ KAKAO_KEY = (
     or st.secrets.get("KAKAO_KEY", "")
     or os.environ.get("KAKAO_REST_API_KEY", "")
     or os.environ.get("KAKAO_KEY", "")
+).strip()
+
+KAKAO_JS_KEY = (
+    st.secrets.get("KAKAO_JAVASCRIPT_KEY", "")
+    or st.secrets.get("KAKAO_JS_KEY", "")
+    or os.environ.get("KAKAO_JAVASCRIPT_KEY", "")
+    or os.environ.get("KAKAO_JS_KEY", "")
 ).strip()
 
 # --- HTTP Session (재시도 포함) ---
@@ -258,6 +266,7 @@ with st.sidebar:
     st.divider()
     auto_track = st.toggle("법정동코드 자동 추적", value=True)
     provider = st.selectbox("자동추적 제공자", ["auto", "vworld", "kakao"], index=0)
+    map_mode = st.selectbox("지도 모드", ["kakao(완전)", "folium(대체)"], index=0)
     show_debug = st.toggle("디버그(오류 상세 보기)", value=False)
 
     test_btn = st.button("연결 테스트(서울시청)")
@@ -266,6 +275,7 @@ with st.sidebar:
         st.write("SERVICE_KEY:", "✅" if SERVICE_KEY else "❌")
         st.write("SERVICE_KEY(원문/디코딩):", "디코딩됨" if (SERVICE_KEY_RAW and SERVICE_KEY != SERVICE_KEY_RAW) else "그대로")
         st.write("KAKAO_REST_API_KEY:", "✅" if KAKAO_KEY else "❌")
+        st.write("KAKAO_JAVASCRIPT_KEY:", "✅" if KAKAO_JS_KEY else "❌")
         st.write("VWORLD_KEY:", "✅" if VWORLD_KEY else "❌")
 
 # --- 상태값 ---
@@ -275,6 +285,22 @@ st.session_state.setdefault("lawd10", "")
 st.session_state.setdefault("last_latlon", None)
 st.session_state.setdefault("last_hint", "")
 st.session_state.setdefault("last_label", "")
+
+# --- v14: Kakao 지도 클릭 좌표를 query params로 전달(리로드 방식) ---
+try:
+    qp = st.query_params
+    q_lat = qp.get("lat")
+    q_lon = qp.get("lon")
+    if q_lat and q_lon:
+        try:
+            st.session_state.lat = float(q_lat)
+            st.session_state.lon = float(q_lon)
+            st.query_params.clear()
+        except Exception:
+            pass
+except Exception:
+    pass
+
 
 # --- 연결 테스트 ---
 if test_btn:
@@ -286,32 +312,79 @@ if test_btn:
         st.error(f"테스트 실패: {mask_secret(hint)}")
 
 # --- 지도 ---
-# v13: Folium 엔진은 유지하되, 배경지도를 카카오 타일로 교체합니다(기존 기능/클릭좌표/자동추적 로직 영향 없음).
-m = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=13, tiles=None, control_scale=True)
+# v14: "kakao(완전)" 모드 = Kakao JS SDK로 지도 렌더링(완전 전환)
+#      클릭 좌표는 query params로 전달하여 Streamlit(Python) 세션에 반영합니다(페이지 리로드 방식).
+#      "folium(대체)" 모드는 기존 방식(안정/백업)으로 유지합니다.
+if "map_mode" not in locals():
+    map_mode = "kakao(완전)"
 
-# ✅ Kakao(daum) 타일: 키 없이 표시되는 공개 타일을 사용합니다.
-#    (화면/UX 개선용 1단계. 다음 단계(v14)에서 카카오 JS SDK로 완전 전환 예정)
-KAKAO_TILES = "https://map.daumcdn.net/map_2d/1900hdi/L{z}/{y}/{x}.png"
-folium.TileLayer(
-    tiles=KAKAO_TILES,
-    name="Kakao",
-    attr="Kakao",
-    overlay=False,
-    control=False,
-    max_zoom=19,
-).add_to(m)
+if map_mode.startswith("kakao"):
+    if not KAKAO_JS_KEY:
+        st.warning("KAKAO_JAVASCRIPT_KEY가 없어 카카오 지도(완전) 모드를 사용할 수 없습니다. 사이드바에서 folium(대체)로 바꾸거나, secrets에 JS 키를 추가하세요.")
+        map_mode = "folium(대체)"
+    else:
+        kakao_html = f"""
+<div id="kakao_map" style="width:100%;height:420px;border-radius:8px;"></div>
+<script type="text/javascript" src="//dapi.kakao.com/v2/maps/sdk.js?appkey={KAKAO_JS_KEY}&autoload=false"></script>
+<script>
+  kakao.maps.load(function() {{
+    var container = document.getElementById('kakao_map');
+    var options = {{
+      center: new kakao.maps.LatLng({st.session_state.lat}, {st.session_state.lon}),
+      level: 4
+    }};
+    var map = new kakao.maps.Map(container, options);
 
-# 예비용: OSM 타일(혹시 카카오 타일이 일시적으로 느리거나 막히면 대비)
-folium.TileLayer(
-    tiles="OpenStreetMap",
-    name="OSM",
-    attr="OpenStreetMap",
-    overlay=False,
-    control=False,
-).add_to(m)
+    var marker = new kakao.maps.Marker({{
+      position: new kakao.maps.LatLng({st.session_state.lat}, {st.session_state.lon})
+    }});
+    marker.setMap(map);
 
-folium.Marker([st.session_state.lat, st.session_state.lon]).add_to(m)
-out = st_folium(m, height=420, use_container_width=True)
+    kakao.maps.event.addListener(map, 'click', function(mouseEvent) {{
+      var latlng = mouseEvent.latLng;
+      var lat = latlng.getLat();
+      var lon = latlng.getLng();
+
+      try {{
+        var url = new URL(window.parent.location.href);
+        url.searchParams.set('lat', lat.toFixed(8));
+        url.searchParams.set('lon', lon.toFixed(8));
+        window.parent.location.href = url.toString();
+      }} catch (e) {{
+        console.log(e);
+      }}
+    }});
+  }});
+</script>
+"""
+        components.html(kakao_html, height=430)
+        out = {"last_clicked": {"lat": st.session_state.lat, "lng": st.session_state.lon}}
+
+if map_mode.startswith("folium"):
+    # v13: Folium 엔진은 유지하되, 배경지도를 카카오 타일로 교체합니다(기존 기능/클릭좌표/자동추적 로직 영향 없음).
+    m = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=13, tiles=None, control_scale=True)
+
+    # ✅ Kakao(daum) 타일
+    KAKAO_TILES = "https://map.daumcdn.net/map_2d/1900hdi/L{z}/{y}/{x}.png"
+    folium.TileLayer(
+        tiles=KAKAO_TILES,
+        name="Kakao",
+        attr="Kakao",
+        overlay=False,
+        control=False,
+        max_zoom=19,
+    ).add_to(m)
+
+    folium.TileLayer(
+        tiles="OpenStreetMap",
+        name="OSM",
+        attr="OpenStreetMap",
+        overlay=False,
+        control=False,
+    ).add_to(m)
+
+    folium.Marker([st.session_state.lat, st.session_state.lon]).add_to(m)
+    out = st_folium(m, height=420, use_container_width=True)
 
 if isinstance(out, dict) and out.get("last_clicked"):
     st.session_state.lat = out["last_clicked"]["lat"]
@@ -414,4 +487,4 @@ if st.button("실거래 조회"):
                 st.success(f"총 {len(merged):,}건")
                 st.dataframe(merged.head(500), use_container_width=True)
 
-st.caption("안정형 v13 – (1단계) 지도 카카오 타일 적용 + resultCode=000 정상 처리 + Dev 엔드포인트 제거(403 회피) + serviceKey 이중 인코딩 방지 + 오류(resultCode/resultMsg) 표시")
+st.caption("안정형 v14 – (완전) 카카오맵 JS SDK 전환 + (대체) folium 유지 + 실거래/법정동 기존 기능 유지")
