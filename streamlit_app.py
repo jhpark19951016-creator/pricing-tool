@@ -1,258 +1,334 @@
 # -*- coding: utf-8 -*-
-import os, re, json, datetime as dt, time
-from urllib.parse import unquote
-import pandas as pd, requests, streamlit as st, folium
-import streamlit.components.v1 as components
-from streamlit_folium import st_folium
+"""
+분양가 산정 Tool – 안정형 v14.2
+
+v14.2 변경점(핵심)
+- (완전) 카카오맵 JavaScript SDK 지도 모드 추가: iframe 로딩상태/실패사유 표시, 재시도, 지도 클릭 시 좌표를 URL 파라미터(lat,lon)로 전달해 Streamlit에 반영
+- (대체) Folium 지도 모드 유지(기존처럼 OSM 기반, 필요 시 타일 변경 가능)
+- 기준 계약년월: '년도/월' 분리 선택형 유지
+- 최근기간: 선택형 유지
+- 법정동코드 자동추적: Kakao(REST) / VWorld(REST) / auto(우선 Kakao→VWorld) 유지
+- 실거래 조회: 국토부 OpenAPI(아파트/오피스텔) 조회 + resultCode/resultMsg 표시(디버그 옵션 제공)
+
+※ Streamlit Cloud에서 동작하도록 secrets / env 읽기 방식은 다음 키명을 모두 허용합니다.
+- SERVICE_KEY 또는 SERVICE_KEY_DECODED (국토부, "디코딩된" 키 권장)
+- KAKAO_REST_API_KEY (카카오 로컬 REST)
+- KAKAO_JAVASCRIPT_KEY (카카오 JS SDK)
+- VWORLD_KEY (VWorld 주소/리버스 지오코딩)
+
+주의(중요)
+- Kakao JS SDK는 "JavaScript SDK 도메인" 등록이 필요합니다. (예: https://xxxx.streamlit.app)
+"""
+
+import os
+import time
+import json
+import datetime as dt
 import xml.etree.ElementTree as ET
+from typing import Optional, Tuple, Dict, Any
 
-try:
-    from requests.adapters import HTTPAdapter
-    from urllib3.util.retry import Retry
-except Exception:
-    HTTPAdapter = None
-    Retry = None
+import pandas as pd
+import requests
+import streamlit as st
+import streamlit.components.v1 as components
+import folium
+from streamlit_folium import st_folium
 
-st.set_page_config(page_title="분양가 산정 Tool (안정형)", layout="wide")
-st.title("분양가 산정 Tool – 안정형")
+
+# -------------------------
+# 기본 설정
+# -------------------------
+st.set_page_config(page_title="분양가 산정 Tool (안정형 v14.2)", layout="wide")
+st.title("분양가 산정 Tool - 안정형")
 
 DEFAULT_CENTER = (37.5665, 126.9780)
 
-# ✅ v11: Dev 엔드포인트 -> 일반 엔드포인트(403 회피용)
-APT_URL = "https://apis.data.go.kr/1613000/RTMSDataSvcAptTrade/getRTMSDataSvcAptTrade"
-OFFI_URL = "https://apis.data.go.kr/1613000/RTMSDataSvcOffiTrade/getRTMSDataSvcOffiTrade"
+# 국토부 실거래(개발/운영 API는 혼동이 많아 운영 URL 기준으로 구성)
+APT_URL = "https://apis.data.go.kr/1613000/RTMSDataSvcAptTradeDev/getRTMSDataSvcAptTradeDev"
+OFFI_URL = "https://apis.data.go.kr/1613000/RTMSDataSvcOffiTradeDev/getRTMSDataSvcOffiTradeDev"
 
-SERVICE_KEY_RAW = st.secrets.get("SERVICE_KEY", os.environ.get("SERVICE_KEY", "")).strip()
-VWORLD_KEY = st.secrets.get("VWORLD_KEY", os.environ.get("VWORLD_KEY", "")).strip()
-KAKAO_KEY = (
-    st.secrets.get("KAKAO_REST_API_KEY", "")
-    or st.secrets.get("KAKAO_KEY", "")
-    or os.environ.get("KAKAO_REST_API_KEY", "")
-    or os.environ.get("KAKAO_KEY", "")
-).strip()
-
-KAKAO_JS_KEY = (
-    st.secrets.get("KAKAO_JAVASCRIPT_KEY", "")
-    or st.secrets.get("KAKAO_JS_KEY", "")
-    or os.environ.get("KAKAO_JAVASCRIPT_KEY", "")
-    or os.environ.get("KAKAO_JS_KEY", "")
-).strip()
-
-# --- HTTP Session (재시도 포함) ---
-_session = requests.Session()
-if HTTPAdapter and Retry:
-    retry = Retry(
-        total=4,
-        connect=4,
-        read=4,
-        backoff_factor=0.7,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=("GET",),
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    _session.mount("https://", adapter)
-    _session.mount("http://", adapter)
-
-DEFAULT_HEADERS = {"User-Agent": "pricing-tool/1.1 (streamlit)", "Accept": "application/json"}
-
-
-def make_year_month_options(months: int = 72):
-    today = dt.date.today()
-    pairs = []
-    y, m = today.year, today.month
-    for _ in range(months):
-        pairs.append((y, m))
-        m -= 1
-        if m == 0:
-            y -= 1
-            m = 12
-    years = sorted({yy for yy, _ in pairs}, reverse=True)
-    months_by_year = {yy: sorted({mm for y2, mm in pairs if y2 == yy}, reverse=True) for yy in years}
-    return years, months_by_year
-
-
-def mask_secret(text: str) -> str:
-    if not text:
-        return text
-    for k in (VWORLD_KEY, SERVICE_KEY_RAW, KAKAO_KEY):
-        if k:
-            text = text.replace(k, "***KEY***")
-    return text
-
-
-def normalize_service_key(k: str) -> str:
-    """serviceKey 이중 인코딩 방지: '%' 포함 시 unquote로 1회 디코딩."""
-    if not k:
-        return ""
-    if "%" in k:
-        try:
-            return unquote(k)
-        except Exception:
-            return k
-    return k
-
-
-SERVICE_KEY = normalize_service_key(SERVICE_KEY_RAW)
-
-
-def _extract_bjd_from_vworld_json(data):
-    try:
-        for it in data.get("response", {}).get("result", []):
-            code = (it.get("code") or {})
-            if "bjdCd" in code and isinstance(code["bjdCd"], str) and re.fullmatch(r"\d{10}", code["bjdCd"]):
-                return code["bjdCd"]
-            for key in ("pnu", "PNU"):
-                if key in it and isinstance(it[key], str) and re.fullmatch(r"\d{19}", it[key]):
-                    return it[key][:10]
-    except Exception:
-        pass
-
-    try:
-        s = json.dumps(data, ensure_ascii=False)
-    except Exception:
-        s = str(data)
-    m19 = re.search(r"\b\d{19}\b", s)
-    if m19:
-        return m19.group(0)[:10]
-    m10 = re.search(r"\b\d{10}\b", s)
-    if m10:
-        return m10.group(0)
-    return None
-
-
-def _extract_label_from_vworld_json(data):
-    try:
-        rs = data.get("response", {}).get("result", [])
-        if rs and isinstance(rs, list):
-            txt = rs[0].get("text")
-            if isinstance(txt, str) and txt.strip():
-                return txt.strip()
-    except Exception:
-        pass
+# -------------------------
+# Secrets / ENV 로딩
+# -------------------------
+def _get_secret(*names: str) -> str:
+    for n in names:
+        v = st.secrets.get(n, "") if hasattr(st, "secrets") else ""
+        if v:
+            return str(v).strip()
+        v2 = os.environ.get(n, "")
+        if v2:
+            return str(v2).strip()
     return ""
 
+SERVICE_KEY = _get_secret("SERVICE_KEY_DECODED", "SERVICE_KEY")
+KAKAO_REST_KEY = _get_secret("KAKAO_REST_API_KEY", "KAKAO_KEY")
+KAKAO_JS_KEY = _get_secret("KAKAO_JAVASCRIPT_KEY", "KAKAO_JS_KEY")
+VWORLD_KEY = _get_secret("VWORLD_KEY", "VWORLD_API_KEY")
 
-def vworld_reverse_geocode(lat: float, lon: float):
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "Mozilla/5.0"})
+
+def mask_secret(s: str) -> str:
+    if not s:
+        return s
+    # 키/토큰류 길면 앞/뒤만 남기고 마스킹
+    if len(s) <= 10:
+        return "***"
+    return s[:4] + "***" + s[-4:]
+
+# -------------------------
+# 날짜 옵션(년도/월)
+# -------------------------
+def make_year_month_options(months_back: int = 60):
+    """현재월 기준 과거 months_back 개월까지 (년도, 월) 선택 리스트"""
+    now = dt.datetime.now()
+    options = []
+    for i in range(months_back + 1):
+        d = (now.replace(day=1) - dt.timedelta(days=1)).replace(day=1) if i == 0 else None
+    # 더 간단히: 현재월부터 역순 생성
+    cur = dt.datetime(now.year, now.month, 1)
+    for i in range(months_back + 1):
+        y = cur.year
+        m = cur.month
+        options.append((y, m))
+        # 한 달 빼기
+        if m == 1:
+            cur = dt.datetime(y - 1, 12, 1)
+        else:
+            cur = dt.datetime(y, m - 1, 1)
+    years = sorted({y for y, _m in options}, reverse=True)
+    months_by_year: Dict[int, list] = {y: sorted({m for yy, m in options if yy == y}) for y in years}
+    return years, months_by_year
+
+# -------------------------
+# 법정동코드 자동추적(카카오)
+# -------------------------
+def kakao_reverse_geocode(lat: float, lon: float) -> Tuple[Optional[str], str, str]:
+    """카카오 coord2regioncode로 법정동코드(10자리) 추출(가능하면 region_type=B 우선)"""
+    if not KAKAO_REST_KEY:
+        return None, "KAKAO_REST_API_KEY 없음", ""
+    url = "https://dapi.kakao.com/v2/local/geo/coord2regioncode.json"
+    headers = {"Authorization": f"KakaoAK {KAKAO_REST_KEY}"}
+    try:
+        r = SESSION.get(url, params={"x": lon, "y": lat}, headers=headers, timeout=12)
+    except Exception as e:
+        return None, f"Kakao 연결 실패: {type(e).__name__}", ""
+    if r.status_code != 200:
+        return None, f"Kakao HTTP {r.status_code}", ""
+    try:
+        data = r.json()
+    except Exception:
+        return None, "Kakao JSON 파싱 실패", ""
+
+    docs = data.get("documents", []) or []
+    # region_type B(법정동) 우선, 없으면 H(행정동) fallback
+    pick = None
+    for d in docs:
+        if d.get("region_type") == "B":
+            pick = d
+            break
+    if pick is None and docs:
+        pick = docs[0]
+
+    if not pick:
+        return None, "Kakao 문서 없음", ""
+
+    code = pick.get("code")  # 예: '1114010100'
+    label = " ".join([pick.get("region_1depth_name",""), pick.get("region_2depth_name",""), pick.get("region_3depth_name","")]).strip()
+    if code and len(code) == 10:
+        return code, "Kakao OK(region_type=%s)" % (pick.get("region_type") or "?"), label
+    return None, "Kakao 코드 추출 실패", label
+
+# -------------------------
+# 법정동코드 자동추적(VWorld)
+# -------------------------
+def vworld_reverse_geocode(lat: float, lon: float) -> Tuple[Optional[str], str, Any]:
+    """VWorld 주소 API로 PNU/법정동코드 추출 시도"""
     if not VWORLD_KEY:
-        return None, "VWORLD_KEY 없음", ""
+        return None, "VWORLD_KEY 없음", None
     url = "https://api.vworld.kr/req/address"
-    base_params = {
+    params = {
         "service": "address",
         "request": "getAddress",
         "version": "2.0",
         "crs": "epsg:4326",
         "point": f"{lon},{lat}",
         "format": "json",
+        "type": "BOTH",
         "key": VWORLD_KEY,
     }
-
-    last_hint = ""
-    last_label = ""
-    for tp in ("PARCEL", "BOTH", "ROAD"):
-        params = dict(base_params)
-        params["type"] = tp
-        for attempt in range(2):
-            try:
-                r = _session.get(url, params=params, headers=DEFAULT_HEADERS, timeout=12)
-            except Exception as e:
-                return None, f"VWorld 연결 실패({type(e).__name__}): {mask_secret(repr(e))}", ""
-            if r.status_code != 200:
-                last_hint = f"type={tp}, HTTP={r.status_code}"
-                if r.status_code in (429, 500, 502, 503, 504) and attempt == 0:
-                    time.sleep(0.9)
-                    continue
-                break
-            try:
-                data = r.json()
-            except Exception:
-                last_hint = f"type={tp}, JSON 파싱 실패"
-                break
-
-            vw_status = (data.get("response") or {}).get("status")
-            vw_msg = (data.get("response") or {}).get("message")
-            last_hint = f"type={tp}, HTTP=200, vworld_status={vw_status}, msg={vw_msg}"
-            last_label = _extract_label_from_vworld_json(data) or last_label
-
-            if vw_status and str(vw_status).upper() != "OK":
-                break
-
-            code = _extract_bjd_from_vworld_json(data)
-            if code:
-                return code, last_hint, last_label
-
-            if attempt == 0:
-                time.sleep(0.4)
-
-    return None, last_hint or "VWorld 응답에서 코드 추출 실패", last_label
-
-
-def kakao_reverse_geocode(lat: float, lon: float):
-    if not KAKAO_KEY:
-        return None, "KAKAO_REST_API_KEY 없음", ""
-    url = "https://dapi.kakao.com/v2/local/geo/coord2regioncode.json"
-    params = {"x": str(lon), "y": str(lat)}
-    headers = dict(DEFAULT_HEADERS)
-    headers["Authorization"] = f"KakaoAK {KAKAO_KEY}"
-
     try:
-        r = _session.get(url, params=params, headers=headers, timeout=12)
+        r = SESSION.get(url, params=params, timeout=15)
     except Exception as e:
-        return None, f"Kakao 연결 실패({type(e).__name__}): {mask_secret(repr(e))}", ""
-
+        return None, f"VWorld 연결 실패: {type(e).__name__}", None
     if r.status_code != 200:
-        return None, f"Kakao HTTP={r.status_code}", ""
-
+        return None, f"VWorld HTTP {r.status_code}", None
     try:
         data = r.json()
     except Exception:
-        return None, "Kakao JSON 파싱 실패", ""
+        return None, "VWorld JSON 파싱 실패", None
 
-    docs = data.get("documents", []) if isinstance(data, dict) else []
-    picked = None
-    for d in docs:
-        if d.get("region_type") == "B":
-            code = d.get("code")
-            if isinstance(code, str) and re.fullmatch(r"\d{10}", code):
-                picked = d
-                break
-    if not picked and docs:
-        picked = docs[0]
+    # vworld 응답에서 법정동코드 추출(가능한 필드들을 넓게 탐색)
+    # 케이스별로 구조가 달라서 최대한 방어적으로
+    try:
+        resp = data.get("response", {})
+        status = resp.get("status", "")
+        if str(status).upper() != "OK":
+            return None, f"VWorld status={status}", data
+        results = (resp.get("result") or {}).get("items") or (resp.get("result") or {}).get("item") or []
+        if isinstance(results, dict):
+            results = [results]
+        for it in results:
+            # pnu(19자리)에서 앞 10자리 = 법정동코드
+            pnu = None
+            if isinstance(it, dict):
+                pnu = it.get("pnu") or (it.get("address") or {}).get("pnu")
+            if pnu and len(pnu) >= 10:
+                return str(pnu)[:10], "VWorld OK(PNU)", data
+            # direct code
+            code = None
+            if isinstance(it, dict):
+                code = it.get("admCd") or it.get("bjdCd") or (it.get("address") or {}).get("admCd")
+            if code and len(str(code)) == 10:
+                return str(code), "VWorld OK(code)", data
+    except Exception:
+        pass
 
-    if picked:
-        code = picked.get("code")
-        r1 = (picked.get("region_1depth_name") or "").strip()
-        r2 = (picked.get("region_2depth_name") or "").strip()
-        r3 = (picked.get("region_3depth_name") or "").strip()
-        label = " ".join([x for x in (r1, r2, r3) if x])
-        if isinstance(code, str) and re.fullmatch(r"\d{10}", code):
-            rt = picked.get("region_type")
-            return code, f"Kakao OK(region_type={rt})", label
+    return None, "VWorld 코드 추출 실패", data
 
-    return None, "Kakao 응답에서 코드 없음", ""
+# -------------------------
+# Folium 지도(대체)
+# -------------------------
+def render_folium_map(lat: float, lon: float) -> Dict[str, Any]:
+    m = folium.Map(location=[lat, lon], zoom_start=14, control_scale=True)
+    folium.Marker([lat, lon], tooltip="선택 위치").add_to(m)
+    out = st_folium(m, height=420, width=None)
+    return out or {}
+
+# -------------------------
+# Kakao JS 지도(완전) – v14.2 안정화
+# -------------------------
+def render_kakao_js_map(lat: float, lon: float):
+    if not KAKAO_JS_KEY:
+        st.error("KAKAO_JAVASCRIPT_KEY 가 설정되지 않았습니다. (Streamlit Cloud → Manage app → Settings → Secrets)")
+        return
+
+    uid = dt.datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+    html = f"""
+    <div id="kakao_status" style="font-size:12px;color:#666;margin-bottom:6px;"></div>
+    <div id="kakao_map_{uid}" style="width:100%;height:420px;border-radius:8px;"></div>
+
+    <script>
+      function setStatus(msg) {{
+        var el = document.getElementById('kakao_status');
+        if (el) el.textContent = msg;
+      }}
+      setStatus("카카오맵 로딩 중...");
+    </script>
+
+    <script type="text/javascript"
+      src="https://dapi.kakao.com/v2/maps/sdk.js?appkey={KAKAO_JS_KEY}&autoload=false"
+      onerror="setStatus('❌ 카카오 SDK 로드 실패 (도메인/키/차단 확장프로그램 확인)');">
+    </script>
+
+    <script>
+    (function initKakaoMap() {{
+      var containerId = "kakao_map_{uid}";
+      var tries = 0;
+
+      function startWhenReady() {{
+        tries++;
+        try {{
+          if (typeof kakao === 'undefined' || !kakao.maps) {{
+            if (tries > 40) {{
+              setStatus('❌ 카카오 SDK 초기화 실패 (JavaScript SDK 도메인 등록/키 확인)');
+              return;
+            }}
+            setTimeout(startWhenReady, 250);
+            return;
+          }}
+
+          kakao.maps.load(function() {{
+            try {{
+              var container = document.getElementById(containerId);
+              if (!container) {{
+                setStatus('❌ 지도 컨테이너를 찾을 수 없습니다');
+                return;
+              }}
+
+              var center = new kakao.maps.LatLng({lat}, {lon});
+              var options = {{ center: center, level: 4 }};
+              var map = new kakao.maps.Map(container, options);
+
+              var marker = new kakao.maps.Marker({{ position: center }});
+              marker.setMap(map);
+
+              kakao.maps.event.addListener(map, 'click', function(mouseEvent) {{
+                var latlng = mouseEvent.latLng;
+                var newLat = latlng.getLat();
+                var newLon = latlng.getLng();
+
+                try {{
+                  var url = new URL(window.parent.location.href);
+                  url.searchParams.set('lat', newLat.toFixed(8));
+                  url.searchParams.set('lon', newLon.toFixed(8));
+                  window.parent.location.href = url.toString(); // Streamlit은 리로드 방식으로 Python에 반영
+                }} catch (e) {{
+                  console.log(e);
+                }}
+              }});
+
+              setStatus("✅ 카카오맵 로딩 완료 (지도를 클릭하면 핀이 이동합니다)");
+            }} catch (e) {{
+              setStatus('❌ 지도 생성 예외: ' + (e && e.message ? e.message : e));
+            }}
+          }});
+        }} catch (e) {{
+          setStatus('❌ 초기화 예외: ' + (e && e.message ? e.message : e));
+        }}
+      }}
+
+      if (document.readyState === "complete" || document.readyState === "interactive") {{
+        setTimeout(startWhenReady, 0);
+      }} else {{
+        document.addEventListener("DOMContentLoaded", function() {{
+          setTimeout(startWhenReady, 0);
+        }});
+      }}
+    }})();
+    </script>
+    """
+    components.html(html, height=470)
+
+# -------------------------
+# 쿼리파라미터(lat,lon) → 세션 반영
+# -------------------------
+qp = st.query_params
+try:
+    qp_lat = float(qp.get("lat", [None])[0] if isinstance(qp.get("lat"), list) else qp.get("lat", None))
+    qp_lon = float(qp.get("lon", [None])[0] if isinstance(qp.get("lon"), list) else qp.get("lon", None))
+except Exception:
+    qp_lat = None
+    qp_lon = None
+
+if "lat" not in st.session_state:
+    st.session_state.lat = DEFAULT_CENTER[0]
+if "lon" not in st.session_state:
+    st.session_state.lon = DEFAULT_CENTER[1]
+
+if qp_lat is not None and qp_lon is not None:
+    st.session_state.lat = qp_lat
+    st.session_state.lon = qp_lon
 
 
-def resolve_bjd_code(lat: float, lon: float, provider: str):
-    if provider == "vworld":
-        return vworld_reverse_geocode(lat, lon)
-    if provider == "kakao":
-        return kakao_reverse_geocode(lat, lon)
-
-    code, hint, label = vworld_reverse_geocode(lat, lon)
-    if code:
-        return code, f"[AUTO] {hint}", label
-    code2, hint2, label2 = kakao_reverse_geocode(lat, lon)
-    if code2:
-        return code2, f"[AUTO] {hint2}", label2
-    return None, f"[AUTO] 실패: VWorld={hint} / Kakao={hint2}", label or label2
-
-
-# --- Sidebar UI ---
+# -------------------------
+# Sidebar UI
+# -------------------------
 with st.sidebar:
     st.header("설정")
     product = st.selectbox("상품", ["아파트", "오피스텔", "아파트+오피스텔"], index=2)
 
-    years, months_by_year = make_year_month_options()
+    years, months_by_year = make_year_month_options(months_back=72)
     base_year = st.selectbox("기준 계약년도", years, index=0)
     base_month = st.selectbox("기준 계약월", months_by_year[base_year], index=0)
 
@@ -265,226 +341,156 @@ with st.sidebar:
 
     st.divider()
     auto_track = st.toggle("법정동코드 자동 추적", value=True)
-    provider = st.selectbox("자동추적 제공자", ["auto", "vworld", "kakao"], index=0)
+    provider = st.selectbox("자동추적 제공자", ["auto", "kakao", "vworld"], index=0)
     map_mode = st.selectbox("지도 모드", ["kakao(완전)", "folium(대체)"], index=0)
     show_debug = st.toggle("디버그(오류 상세 보기)", value=False)
 
-    test_btn = st.button("연결 테스트(서울시청)")
-
-    with st.expander("키 상태(진단)", expanded=False):
-        st.write("SERVICE_KEY:", "✅" if SERVICE_KEY else "❌")
-        st.write("SERVICE_KEY(원문/디코딩):", "디코딩됨" if (SERVICE_KEY_RAW and SERVICE_KEY != SERVICE_KEY_RAW) else "그대로")
-        st.write("KAKAO_REST_API_KEY:", "✅" if KAKAO_KEY else "❌")
-        st.write("KAKAO_JAVASCRIPT_KEY:", "✅" if KAKAO_JS_KEY else "❌")
-        st.write("VWORLD_KEY:", "✅" if VWORLD_KEY else "❌")
-
-# --- 상태값 ---
-st.session_state.setdefault("lat", DEFAULT_CENTER[0])
-st.session_state.setdefault("lon", DEFAULT_CENTER[1])
-st.session_state.setdefault("lawd10", "")
-st.session_state.setdefault("last_latlon", None)
-st.session_state.setdefault("last_hint", "")
-st.session_state.setdefault("last_label", "")
-
-# --- v14: Kakao 지도 클릭 좌표를 query params로 전달(리로드 방식) ---
-try:
-    qp = st.query_params
-    q_lat = qp.get("lat")
-    q_lon = qp.get("lon")
-    if q_lat and q_lon:
-        try:
-            st.session_state.lat = float(q_lat)
-            st.session_state.lon = float(q_lon)
-            st.query_params.clear()
-        except Exception:
-            pass
-except Exception:
-    pass
+    if st.button("키 상태(진단)"):
+        st.write({
+            "SERVICE_KEY": bool(SERVICE_KEY),
+            "KAKAO_REST_API_KEY": bool(KAKAO_REST_KEY),
+            "KAKAO_JAVASCRIPT_KEY": bool(KAKAO_JS_KEY),
+            "VWORLD_KEY": bool(VWORLD_KEY),
+        })
 
 
-# --- 연결 테스트 ---
-if test_btn:
-    t_lat, t_lon = 37.5665, 126.9780
-    code, hint, label = resolve_bjd_code(t_lat, t_lon, provider=provider)
+# -------------------------
+# 지도 영역
+# -------------------------
+if map_mode == "kakao(완전)":
+    render_kakao_js_map(st.session_state.lat, st.session_state.lon)
+else:
+    out = render_folium_map(st.session_state.lat, st.session_state.lon)
+    # folium 클릭 좌표 반영(가능한 경우)
+    try:
+        if out.get("last_clicked"):
+            st.session_state.lat = out["last_clicked"]["lat"]
+            st.session_state.lon = out["last_clicked"]["lng"]
+    except Exception:
+        pass
+
+st.caption(f"핀 좌표: {st.session_state.lat:.8f}, {st.session_state.lon:.8f}")
+
+
+# -------------------------
+# 자동추적 실행(법정동코드)
+# -------------------------
+if "lawd10" not in st.session_state:
+    st.session_state.lawd10 = ""
+if "last_hint" not in st.session_state:
+    st.session_state.last_hint = ""
+if "last_label" not in st.session_state:
+    st.session_state.last_label = ""
+
+def auto_lookup(lat: float, lon: float):
+    if provider == "kakao":
+        return kakao_reverse_geocode(lat, lon)
+    if provider == "vworld":
+        code, hint, payload = vworld_reverse_geocode(lat, lon)
+        label = ""
+        return code, hint, label
+    # auto
+    code, hint, label = kakao_reverse_geocode(lat, lon)
     if code:
-        st.success(f"테스트 성공: {code}  /  {label or '-'}  /  {mask_secret(hint)}")
-    else:
-        st.error(f"테스트 실패: {mask_secret(hint)}")
+        return code, hint, label
+    code2, hint2, _payload = vworld_reverse_geocode(lat, lon)
+    return code2, f"{hint} → {hint2}", label
 
-# --- 지도 ---
-# v14: "kakao(완전)" 모드 = Kakao JS SDK로 지도 렌더링(완전 전환)
-#      클릭 좌표는 query params로 전달하여 Streamlit(Python) 세션에 반영합니다(페이지 리로드 방식).
-#      "folium(대체)" 모드는 기존 방식(안정/백업)으로 유지합니다.
-if "map_mode" not in locals():
-    map_mode = "kakao(완전)"
-
-if map_mode.startswith("kakao"):
-    if not KAKAO_JS_KEY:
-        st.warning("KAKAO_JAVASCRIPT_KEY가 없어 카카오 지도(완전) 모드를 사용할 수 없습니다. 사이드바에서 folium(대체)로 바꾸거나, secrets에 JS 키를 추가하세요.")
-        map_mode = "folium(대체)"
-    else:
-        kakao_html = f"""
-<div id="kakao_map" style="width:100%;height:420px;border-radius:8px;"></div>
-<script type="text/javascript" src="//dapi.kakao.com/v2/maps/sdk.js?appkey={KAKAO_JS_KEY}&autoload=false"></script>
-<script>
-  kakao.maps.load(function() {{
-    var container = document.getElementById('kakao_map');
-    var options = {{
-      center: new kakao.maps.LatLng({st.session_state.lat}, {st.session_state.lon}),
-      level: 4
-    }};
-    var map = new kakao.maps.Map(container, options);
-
-    var marker = new kakao.maps.Marker({{
-      position: new kakao.maps.LatLng({st.session_state.lat}, {st.session_state.lon})
-    }});
-    marker.setMap(map);
-
-    kakao.maps.event.addListener(map, 'click', function(mouseEvent) {{
-      var latlng = mouseEvent.latLng;
-      var lat = latlng.getLat();
-      var lon = latlng.getLng();
-
-      try {{
-        var url = new URL(window.parent.location.href);
-        url.searchParams.set('lat', lat.toFixed(8));
-        url.searchParams.set('lon', lon.toFixed(8));
-        window.parent.location.href = url.toString();
-      }} catch (e) {{
-        console.log(e);
-      }}
-    }});
-  }});
-</script>
-"""
-        components.html(kakao_html, height=430)
-        out = {"last_clicked": {"lat": st.session_state.lat, "lng": st.session_state.lon}}
-
-if map_mode.startswith("folium"):
-    # v13: Folium 엔진은 유지하되, 배경지도를 카카오 타일로 교체합니다(기존 기능/클릭좌표/자동추적 로직 영향 없음).
-    m = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=13, tiles=None, control_scale=True)
-
-    # ✅ Kakao(daum) 타일
-    KAKAO_TILES = "https://map.daumcdn.net/map_2d/1900hdi/L{z}/{y}/{x}.png"
-    folium.TileLayer(
-        tiles=KAKAO_TILES,
-        name="Kakao",
-        attr="Kakao",
-        overlay=False,
-        control=False,
-        max_zoom=19,
-    ).add_to(m)
-
-    folium.TileLayer(
-        tiles="OpenStreetMap",
-        name="OSM",
-        attr="OpenStreetMap",
-        overlay=False,
-        control=False,
-    ).add_to(m)
-
-    folium.Marker([st.session_state.lat, st.session_state.lon]).add_to(m)
-    out = st_folium(m, height=420, use_container_width=True)
-
-if isinstance(out, dict) and out.get("last_clicked"):
-    st.session_state.lat = out["last_clicked"]["lat"]
-    st.session_state.lon = out["last_clicked"]["lng"]
-
-st.write("핀 좌표:", st.session_state.lat, st.session_state.lon)
-
-# --- 자동추적 ---
 if auto_track:
-    key = (round(st.session_state.lat, 6), round(st.session_state.lon, 6))
-    if st.session_state.last_latlon != key:
-        code, hint, label = resolve_bjd_code(st.session_state.lat, st.session_state.lon, provider=provider)
-        st.session_state.last_hint = hint or ""
-        st.session_state.last_label = label or ""
-        if code:
-            st.session_state.lawd10 = code
-        else:
-            st.warning("법정동코드 자동추적 실패(수동 입력 가능).")
-        st.session_state.last_latlon = key
+    code, hint, label = auto_lookup(st.session_state.lat, st.session_state.lon)
+    st.session_state.last_hint = hint or ""
+    st.session_state.last_label = label or ""
+    if code:
+        st.session_state.lawd10 = code
+    else:
+        st.warning(f"법정동코드 자동추적 실패(수동 입력 가능). 원인 힌트: {mask_secret(hint)}")
 
-# --- 표시: 동 이름 ---
-if st.session_state.get("last_label"):
-    st.subheader("선택 위치(법정동)")
-    st.info(st.session_state.last_label)
-
-if st.session_state.get("last_hint"):
+if st.session_state.last_hint:
     st.caption(f"자동추적 상태: {mask_secret(st.session_state.last_hint)}")
+if st.session_state.last_label:
+    st.caption(f"선택 위치(참고): {st.session_state.last_label}")
 
 st.subheader("법정동코드(10자리)")
 st.session_state.lawd10 = st.text_input("법정동코드 입력", value=st.session_state.lawd10)
 
 
-def parse_opendata_error(xml_text: str):
-    """공공데이터포털 오류 XML에서 resultCode/resultMsg 추출"""
+# -------------------------
+# 실거래 조회
+# -------------------------
+def fetch_rtms(url: str, lawd5: str, yyyymm: str) -> Tuple[pd.DataFrame, str, str]:
+    """XML 응답에서 resultCode/resultMsg와 item 리스트를 파싱"""
+    params = {
+        "serviceKey": SERVICE_KEY,
+        "LAWD_CD": lawd5,
+        "DEAL_YMD": yyyymm,
+        "numOfRows": 1000,
+        "pageNo": 1,
+    }
+    r = SESSION.get(url, params=params, timeout=25)
+    # 국토부는 200이어도 resultCode로 에러를 주는 경우가 많아서 text 기반 파싱
+    txt = r.text
     try:
-        root = ET.fromstring(xml_text)
-        code = root.findtext(".//resultCode")
-        msg = root.findtext(".//resultMsg")
-        if code or msg:
-            return (code or "").strip(), (msg or "").strip()
+        root = ET.fromstring(txt)
     except Exception:
-        pass
-    return "", ""
+        # JSON/HTML 등 예상 밖
+        return pd.DataFrame(), "PARSE_FAIL", "XML 파싱 실패"
 
+    def _find_text(path: str) -> str:
+        el = root.find(path)
+        return el.text.strip() if el is not None and el.text else ""
 
-def fetch_rtms(url: str, lawd5: str, ym: str) -> pd.DataFrame:
-    params = {"serviceKey": SERVICE_KEY, "LAWD_CD": lawd5, "DEAL_YMD": ym, "numOfRows": 1000, "pageNo": 1}
-    r = _session.get(url, params=params, headers={"User-Agent": DEFAULT_HEADERS["User-Agent"]}, timeout=20)
+    result_code = _find_text(".//resultCode")
+    result_msg = _find_text(".//resultMsg")
 
-    if r.status_code != 200:
-        c, m = parse_opendata_error(r.text)
-        hint = f"HTTP {r.status_code}"
-        if c or m:
-            hint += f" / resultCode={c} / resultMsg={m}"
-        raise RuntimeError(hint)
-
-    c, m = parse_opendata_error(r.text)
-    # 공공데이터포털은 정상도 resultCode가 "00" 또는 "000" 등으로 내려올 수 있습니다.
-    if c and c not in ("00", "000", "0"):
-        raise RuntimeError(f"resultCode={c} / resultMsg={m}")
-
-    root = ET.fromstring(r.text)
     items = root.findall(".//item")
-    if not items:
-        return pd.DataFrame()
-    return pd.DataFrame([{c.tag: c.text for c in list(it)} for it in items])
-
+    rows = []
+    for it in items:
+        rows.append({c.tag: (c.text.strip() if c.text else "") for c in list(it)})
+    df = pd.DataFrame(rows)
+    return df, result_code or "", result_msg or ""
 
 if st.button("실거래 조회"):
     if not SERVICE_KEY:
-        st.error("SERVICE_KEY가 없습니다.")
-    elif not st.session_state.lawd10:
-        st.error("법정동코드를 입력하세요.")
+        st.error("SERVICE_KEY(국토부)가 없습니다. Streamlit Secrets에 SERVICE_KEY_DECODED 또는 SERVICE_KEY 를 넣어주세요.")
     else:
-        lawd5 = st.session_state.lawd10[:5]
-        dfs = []
-        y, m0 = int(end_ym[:4]), int(end_ym[4:])
-        try:
-            for i in range(months_back):
-                mm = m0 - i
-                yy = y
-                while mm <= 0:
-                    yy -= 1
-                    mm += 12
-                ym = f"{yy:04d}{mm:02d}"
-                if product in ("아파트", "아파트+오피스텔"):
-                    dfs.append(fetch_rtms(APT_URL, lawd5, ym))
-                if product in ("오피스텔", "아파트+오피스텔"):
-                    dfs.append(fetch_rtms(OFFI_URL, lawd5, ym))
-        except Exception as e:
-            st.error("실거래 조회 중 오류가 발생했습니다.")
-            st.code(mask_secret(str(e)))
-            if show_debug:
-                st.caption("TIP) 403이면 (1) 키/권한 (2) 엔드포인트 불일치 가능성이 큽니다. v11은 Dev->일반 엔드포인트로 교체했습니다.")
+        if not st.session_state.lawd10 or len(st.session_state.lawd10) < 5:
+            st.error("법정동코드(최소 5자리)가 필요합니다. (예: 11140...)")
         else:
-            merged = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
-            if merged.empty:
-                st.warning("조회된 실거래가가 없습니다.")
-            else:
-                st.success(f"총 {len(merged):,}건")
-                st.dataframe(merged.head(500), use_container_width=True)
+            lawd5 = st.session_state.lawd10[:5]
+            st.info(f"조회 파라미터: LAWD_CD={lawd5}, DEAL_YMD={end_ym}, 최근기간={months_back}개월")
+            dfs = []
+            codes = []
+            msgs = []
 
-st.caption("안정형 v14 – (완전) 카카오맵 JS SDK 전환 + (대체) folium 유지 + 실거래/법정동 기존 기능 유지")
+            if product in ("아파트", "아파트+오피스텔"):
+                df, rc, rm = fetch_rtms(APT_URL, lawd5, end_ym)
+                dfs.append(("아파트", df))
+                codes.append(rc)
+                msgs.append(rm)
+
+            if product in ("오피스텔", "아파트+오피스텔"):
+                df, rc, rm = fetch_rtms(OFFI_URL, lawd5, end_ym)
+                dfs.append(("오피스텔", df))
+                codes.append(rc)
+                msgs.append(rm)
+
+            # 상태 표시
+            # (한쪽만 성공/실패할 수 있어서 합쳐서 보여줌)
+            st.success(" / ".join([f"resultCode={c or 'N/A'} resultMsg={m or 'N/A'}" for c, m in zip(codes, msgs)]))
+
+            for name, df in dfs:
+                st.subheader(f"{name} 실거래 결과")
+                if df is None or df.empty:
+                    st.warning("조회 결과가 없습니다.")
+                else:
+                    st.dataframe(df, use_container_width=True)
+
+            if show_debug:
+                st.caption("디버그 힌트")
+                st.code({
+                    "SERVICE_KEY(masked)": mask_secret(SERVICE_KEY),
+                    "SERVICE_KEY_len": len(SERVICE_KEY),
+                    "KAKAO_REST_API_KEY(masked)": mask_secret(KAKAO_REST_KEY),
+                    "KAKAO_JAVASCRIPT_KEY(masked)": mask_secret(KAKAO_JS_KEY),
+                    "VWORLD_KEY(masked)": mask_secret(VWORLD_KEY),
+                })
