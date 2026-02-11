@@ -427,7 +427,7 @@ if map_mode.startswith("kakao"):
 </script>
 """
 
-kakao_html = (
+        kakao_html = (
             kakao_html_tpl
             .replace("__APPKEY__", KAKAO_JS_KEY)
             .replace("__LAT__", f"{st.session_state.lat}")
