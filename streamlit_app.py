@@ -328,136 +328,106 @@ if map_mode.startswith("kakao"):
 
         # ⚠️ f-string 안에 JS 중괄호({})가 들어가면 Python 파서가 포맷으로 오해해서 SyntaxError가 납니다.
         # 그래서 템플릿 문자열 + replace 방식으로 안전하게 HTML을 생성합니다.
-        kakao_html_tpl = """<div id="kakao_status___UID__" style="font-size:12px;color:#666;margin:0 0 6px 0;">카카오맵 로딩 중...</div>
+        kakao_html_tpl = """<div id="kakao_status___UID__" style="font-size:12px;color:#666;margin-bottom:6px;">카카오맵 로딩 준비...</div>
 <div id="kakao_map___UID__" style="width:100%;height:420px;border-radius:8px;"></div>
 
 <script>
-(function() {
-  function setStatus(msg) {
-    var el = document.getElementById("kakao_status___UID__");
-    if (el) el.innerText = msg;
+(function(){
+  const uid = "__UID__";
+  const statusEl = document.getElementById("kakao_status___UID__");
+  const mapEl = document.getElementById("kakao_map___UID__");
+  function setStatus(msg, isErr){
+    if(!statusEl) return;
+    statusEl.textContent = msg;
+    statusEl.style.color = isErr ? "#c62828" : "#666";
   }
 
-  var started = false;
-  var tries = 0;
-  var loadCallbackFired = false;
-  var mapReady = false;
-
-  function bindClick(map) {
-    try {
-      kakao.maps.event.addListener(map, 'click', function(mouseEvent) {
-        var latlng = mouseEvent.latLng;
-        var lat = latlng.getLat();
-        var lon = latlng.getLng();
-        try {
-          var url = new URL(window.parent.location.href);
-          url.searchParams.set("lat", lat.toFixed(8));
-          url.searchParams.set("lon", lon.toFixed(8));
-          window.parent.location.href = url.toString();
-        } catch (e) {
-          console.log(e);
-        }
-      });
-    } catch (e) {}
+  // 부모(스트림릿)로 메시지 전달
+  function postToParent(payload){
+    try { window.parent.postMessage(payload, "*"); } catch(e) {}
   }
 
-  function createMap() {
-    var container = document.getElementById("kakao_map___UID__");
-    if (!container) {
-      setStatus("❌ 지도 컨테이너를 찾을 수 없습니다");
+  setStatus("카카오 SDK 로딩 중...");
+
+  // SDK 로드 (autoload 기본값 true 사용)
+  // NOTE: 사용자가 직접 https://dapi.kakao.com/v2/maps/sdk.js 를 열면 Authorization 오류가 뜨는 것이 정상입니다.
+  //       반드시 ?appkey=... 로 불러와야 합니다.
+  const sdk = document.createElement("script");
+  sdk.type = "text/javascript";
+  sdk.src = "https://dapi.kakao.com/v2/maps/sdk.js?appkey=__APPKEY__&libraries=services";
+  sdk.async = true;
+
+  sdk.onerror = function(){
+    setStatus("❌ 카카오 SDK 로드 실패 (도메인 등록/키/차단 확인 필요)", true);
+    postToParent({type:"KAKAO_SDK_ERROR", uid, stage:"sdk_onerror"});
+  };
+
+  document.head.appendChild(sdk);
+
+  let startedAt = Date.now();
+  let mapObj = null;
+  let marker = null;
+
+  function initMap(){
+    if(mapObj) return;
+
+    if(!mapEl){
+      setStatus("❌ 지도 컨테이너를 찾을 수 없습니다", true);
       return;
     }
-    var center = new kakao.maps.LatLng(__LAT__, __LON__);
-    var map = new kakao.maps.Map(container, { center: center, level: 4 });
-    var marker = new kakao.maps.Marker({ position: center });
-    marker.setMap(map);
-    mapReady = true;
-    bindClick(map);
-    setStatus("✅ 카카오맵 로딩 완료 (지도를 클릭하면 핀이 이동합니다)");
-  }
 
-  function start() {
-    if (started) return;
-    started = true;
+    const lat = parseFloat("__LAT__");
+    const lon = parseFloat("__LON__");
 
-    try {
-      if (kakao.maps && typeof kakao.maps.load === "function") {
-        setStatus("카카오 SDK 로드됨. 지도 초기화 중...");
-        kakao.maps.load(function() {
-          loadCallbackFired = true;
-          try {
-            createMap();
-          } catch (e) {
-            setStatus("❌ 지도 생성 예외: " + (e && e.message ? e.message : e));
-          }
-        });
-      } else {
-        // autoload=true 환경(혹은 load 함수 미제공) 대응
-        loadCallbackFired = true;
-        createMap();
+    const center = new kakao.maps.LatLng(lat, lon);
+    mapObj = new kakao.maps.Map(mapEl, { center: center, level: 6 });
+
+    marker = new kakao.maps.Marker({ position: center });
+    marker.setMap(mapObj);
+
+    // 클릭 시 좌표/마커 업데이트 + 부모에 전달
+    kakao.maps.event.addListener(mapObj, "click", function(mouseEvent){
+      try{
+        const ll = mouseEvent.latLng;
+        marker.setPosition(ll);
+        const payload = {type:"KAKAO_MAP_CLICK", uid, lat: ll.getLat(), lon: ll.getLng()};
+        postToParent(payload);
+        setStatus("✅ 클릭 좌표 반영: " + ll.getLat().toFixed(6) + ", " + ll.getLng().toFixed(6));
+      }catch(e){
+        setStatus("❌ 클릭 이벤트 처리 오류: " + (e && e.message ? e.message : e), true);
       }
-    } catch (e) {
-      setStatus("❌ 초기화 예외: " + (e && e.message ? e.message : e));
-    }
+    });
+
+    setStatus("✅ 카카오맵 로딩 완료");
+    postToParent({type:"KAKAO_MAP_READY", uid});
   }
 
-  function waitForKakao() {
-    tries++;
-    if (tries % 4 === 0) {
-      setStatus("카카오 SDK 초기화 대기중... (" + tries + ")");
-    }
-
-    if (typeof kakao !== "undefined" && kakao.maps) {
-      setStatus("카카오 SDK 로드됨. 지도 초기화 중...");
-      start();
-
-      // load 콜백/지도생성 워치독
-      setTimeout(function() {
-        if (started && !loadCallbackFired) {
-          setStatus("❌ kakao.maps.load 콜백이 실행되지 않습니다. (JS SDK 도메인 미등록/키 제한/사내망 차단 가능) - 브라우저 개발자도구 Console 확인 필요");
-        }
-      }, 6000);
-
-      setTimeout(function() {
-        if (started && loadCallbackFired && !mapReady) {
-          setStatus("❌ 지도 생성이 완료되지 않았습니다. (JS SDK 도메인 등록/키 확인, 광고차단/보안 확장프로그램, 사내망 dapi.kakao.com 차단 여부 확인)");
-        }
-      }, 9000);
-
+  // SDK 준비 여부 폴링
+  const timer = setInterval(function(){
+    const ok = (typeof kakao !== "undefined") && kakao.maps && kakao.maps.Map && kakao.maps.LatLng;
+    if(ok){
+      clearInterval(timer);
+      try{
+        initMap();
+      }catch(e){
+        setStatus("❌ 지도 초기화 예외: " + (e && e.message ? e.message : e), true);
+        postToParent({type:"KAKAO_SDK_ERROR", uid, stage:"init_exception", detail:String(e)});
+      }
       return;
     }
 
-    if (tries > 60) {
-      setStatus("❌ 카카오 SDK 초기화 실패 (JavaScript SDK 도메인 등록/키 확인 필요)");
-      return;
+    const elapsed = Date.now() - startedAt;
+    if(elapsed > 8000){
+      clearInterval(timer);
+      setStatus("❌ kakao 객체가 준비되지 않습니다. (JS SDK 도메인 미등록/키 제한/확장프로그램/사내망 차단 가능) 브라우저 개발자도구 Console 확인 필요", true);
+      postToParent({type:"KAKAO_SDK_ERROR", uid, stage:"timeout_no_kakao"});
     }
-    setTimeout(waitForKakao, 250);
-  }
-
-  // 워치독(12초)
-  setTimeout(function() {
-    if (!started) {
-      setStatus("⏳ 아직 로딩중입니다. (도메인 등록/키/광고차단 확장프로그램을 확인해 주세요)");
-    }
-  }, 12000);
-
-  // SDK 스크립트 로드
-  var s = document.createElement("script");
-  s.src = "https://dapi.kakao.com/v2/maps/sdk.js?appkey=__APPKEY__&autoload=false";
-  s.async = true;
-  s.onload = function() {
-    setStatus("카카오 SDK 로드됨. 지도 초기화 중...");
-    waitForKakao();
-  };
-  s.onerror = function() {
-    setStatus("❌ 카카오 SDK 스크립트 로드 실패 (사내망 차단/광고차단/키 확인)");
-  };
-  document.head.appendChild(s);
+  }, 250);
 })();
 </script>
 """
 
-        kakao_html = (
+kakao_html = (
             kakao_html_tpl
             .replace("__APPKEY__", KAKAO_JS_KEY)
             .replace("__LAT__", f"{st.session_state.lat}")
