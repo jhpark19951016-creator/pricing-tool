@@ -1,5 +1,6 @@
 streamlit
-requests
 pandas
-streamlit-folium
+requests
 folium
+streamlit-folium
+python-dateutil

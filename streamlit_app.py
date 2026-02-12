@@ -11,8 +11,8 @@ except Exception:
     HTTPAdapter = None
     Retry = None
 
-st.set_page_config(page_title="분양가 산정 Tool (안정형 v14.12-A1)", layout="wide")
-st.title("분양가 산정 Tool – 안정형 v14.12-A1")
+st.set_page_config(page_title="분양가 산정 Tool (안정형 v14.12-A2)", layout="wide")
+st.title("분양가 산정 Tool – 안정형 v14.12-A2")
 
 DEFAULT_CENTER = (37.5665, 126.9780)
 
@@ -103,6 +103,7 @@ def _extract_bjd_from_vworld_json(data):
     return None
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
 def vworld_reverse_geocode(lat: float, lon: float):
     if not VWORLD_KEY:
         return None, "VWORLD_KEY 없음"
@@ -158,6 +159,7 @@ def vworld_reverse_geocode(lat: float, lon: float):
     return None, last_hint or "VWorld 응답에서 코드 추출 실패"
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
 def kakao_reverse_geocode(lat: float, lon: float):
     """카카오 로컬 API: coord2regioncode → 법정동코드(10자리) (region_type=B)"""
     if not KAKAO_KEY:
@@ -244,6 +246,9 @@ st.session_state.setdefault("lon", DEFAULT_CENTER[1])
 st.session_state.setdefault("lawd10", "")
 st.session_state.setdefault("last_latlon", None)
 st.session_state.setdefault("map_click_key", None)
+st.session_state.setdefault("map_clicked", False)
+st.session_state.setdefault("init_autotrack_done", False)
+st.session_state.setdefault("last_click_ts", 0.0)
 st.session_state.setdefault("last_hint", "")
 
 # --- 연결 테스트 ---
@@ -273,21 +278,36 @@ if isinstance(out, dict) and out.get("last_clicked"):
         st.session_state.lat = new_lat
         st.session_state.lon = new_lon
         st.session_state.map_click_key = new_key
+        st.session_state.map_clicked = True
+        st.session_state.last_click_ts = time.time()
         st.rerun()
 
 st.write("핀 좌표:", st.session_state.lat, st.session_state.lon)
 
 # --- 자동추적 ---
+# 체감 속도 개선: "클릭했을 때만" 자동추적을 실행합니다.
+# - 초기 1회(앱 시작)만 기본 좌표로 자동추적(선택 사항)
+# - 이후에는 지도 클릭으로 좌표가 바뀐 경우에만 호출
 if auto_track:
-    key = (round(st.session_state.lat, 6), round(st.session_state.lon, 6))
-    if st.session_state.last_latlon != key:
-        code, hint = resolve_bjd_code(st.session_state.lat, st.session_state.lon, provider=provider)
-        st.session_state.last_hint = hint or ""
-        if code:
-            st.session_state.lawd10 = code
-        else:
-            st.warning("법정동코드 자동추적 실패(수동 입력 가능).")
-        st.session_state.last_latlon = key
+    # 앱 첫 로드에서 1회만 기본 좌표로 자동추적을 수행(원치 않으면 아래 2줄을 주석처리)
+    if (not st.session_state.init_autotrack_done) and not st.session_state.lawd10:
+        st.session_state.map_clicked = True
+        st.session_state.init_autotrack_done = True
+
+    if st.session_state.get("map_clicked", False):
+        key = (round(st.session_state.lat, 6), round(st.session_state.lon, 6))
+        if st.session_state.last_latlon != key:
+            with st.spinner("법정동코드 자동추적 중..."):
+                code, hint = resolve_bjd_code(st.session_state.lat, st.session_state.lon, provider=provider)
+            st.session_state.last_hint = hint or ""
+            if code:
+                st.session_state.lawd10 = code
+            else:
+                st.warning("법정동코드 자동추적 실패(수동 입력 가능).")
+            st.session_state.last_latlon = key
+        # 클릭 이벤트 처리 완료
+        st.session_state.map_clicked = False
+
 
 if st.session_state.get("last_hint"):
     st.caption(f"자동추적 상태: {mask_secret(st.session_state.last_hint)}")
