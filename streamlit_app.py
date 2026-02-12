@@ -257,7 +257,7 @@ def render_map_kakao_js(lat: float, lon: float, js_key: str, height: int = 520, 
     # autoload=false로 명시 로드를 기본으로 시도합니다.
     sdk_url = (
         "https://dapi.kakao.com/v2/maps/sdk.js"
-        f"?appkey={js_key}&autoload=false&libraries=services,clusterer,drawing&protocol=https"
+        f"?appkey={js_key}&autoload=false&libraries=services,clusterer,drawing"
     )
 
     # NOTE: 중괄호가 많은 JS를 안전하게 넣기 위해 f-string을 최소화하고 .format만 사용합니다.
