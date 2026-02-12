@@ -3,4 +3,4 @@ pandas
 requests
 folium
 streamlit-folium
-urllib3
+python-dateutil
