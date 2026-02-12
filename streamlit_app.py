@@ -28,7 +28,7 @@ except Exception:
 
 import streamlit.components.v1 as components
 
-APP_VERSION = "v14.8"
+APP_VERSION = "v14.11"
 
 # -----------------------------
 # 공통 유틸
@@ -164,6 +164,7 @@ def choose_service_key() -> Tuple[str, str]:
 APT_URL = "https://apis.data.go.kr/1613000/RTMSDataSvcAptTradeDev/getRTMSDataSvcAptTradeDev"
 OFFICE_URL = "https://apis.data.go.kr/1613000/RTMSDataSvcOffiTrade/getRTMSDataSvcOffiTrade"
 
+@st.cache_data(ttl=3600)
 def fetch_rtms(lawd_cd_5: str, deal_ym: str, product: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
     lawd_cd_5: 구 코드(5자리) - 법정동코드(10자리)에서 앞 5자리 사용
@@ -470,7 +471,7 @@ def render_map_kakao_js(lat: float, lon: float, js_key: str, height: int = 520, 
 st.set_page_config(page_title=f"분양가 산정 Tool - 안정형 {APP_VERSION}", layout="wide")
 
 st.title("분양가 산정 Tool - 안정형")
-st.caption(f"버전: {APP_VERSION}  |  지도: Kakao JS/Leaflet  |  법정동/실거래: Kakao/공공데이터")
+st.caption(f"버전: {APP_VERSION}  |  지도: Leaflet(OSM)/Kakao(JS-SDK)  |  법정동/실거래: Kakao/공공데이터")
 
 # Sidebar: 설정
 with st.sidebar:
@@ -489,8 +490,8 @@ with st.sidebar:
 
     st.divider()
     map_mode = st.selectbox("지도 모드", [
-        "kakao(JS-SDK/권장)",
-        "leaflet(OSM/대안)",
+        "leaflet(OSM/권장)",
+        "kakao(JS-SDK/실험)",
     ], index=0)
 
     show_debug = st.toggle("디버그(오류 상세 보기)", value=False)
@@ -532,6 +533,7 @@ map_col, info_col = st.columns([2.2, 1.2], gap="large")
 
 with map_col:
     if map_mode.startswith("kakao"):
+        st.warning("⚠️ 카카오 JS-SDK 모드는 Streamlit의 iframe(srcdoc) 특성상 HTTPS/프로토콜 판별 이슈로 타일이 http로 내려가며(혼합 콘텐츠) 지도 생성이 멈출 수 있습니다. 우선 안정적으로는 Leaflet(OSM)을 권장합니다.")
         hint = render_map_kakao_js(lat, lon, KAKAO_JAVASCRIPT_KEY, height=520)
         if show_debug:
             st.info(hint)
