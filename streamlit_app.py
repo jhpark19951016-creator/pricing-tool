@@ -51,7 +51,10 @@ def _parse_rtms_error(xml_text: str):
 
 @st.cache_data(show_spinner=False, ttl=60*10)
 def _kakao_coord2region(lat: float, lon: float, kakao_rest_key: str):
-    """좌표 -> 행정구역명(시/구/동)"""
+    """좌표 -> (법정동코드10자리, 행정구역명) 반환.
+    - Kakao Local API coord2regioncode 사용
+    - region_type 'B'(법정동) 우선
+    """
     if not kakao_rest_key:
         return None
     url = "https://dapi.kakao.com/v2/local/geo/coord2regioncode.json"
@@ -60,40 +63,62 @@ def _kakao_coord2region(lat: float, lon: float, kakao_rest_key: str):
     r = requests.get(url, headers=headers, params=params, timeout=10)
     if r.status_code != 200:
         return None
-    data = r.json()
+    data = r.json() or {}
     docs = data.get("documents") or []
-    # region_type 'B' (법정동) 우선
     docs_sorted = sorted(docs, key=lambda d: 0 if d.get("region_type") == "B" else 1)
     if not docs_sorted:
         return None
     d = docs_sorted[0]
+    code10 = d.get("code")  # 10자리 법정동코드(bcode)
     r1 = d.get("region_1depth_name") or ""
     r2 = d.get("region_2depth_name") or ""
     r3 = d.get("region_3depth_name") or ""
-    return " ".join([p for p in [r1, r2, r3] if p]).strip()
+    name = " ".join([p for p in [r1, r2, r3] if p]).strip()
+    return {"code10": code10, "name": name}
+
+
 
 with st.sidebar:
     st.header("설정")
     product = st.selectbox("상품", ["아파트", "오피스텔", "아파트+오피스텔"], index=2)
     end_ym = st.text_input("기준 계약년월(YYYYMM)", value=dt.date.today().strftime("%Y%m"))
     months_back = st.number_input("최근 기간(개월)", 1, 36, 6)
+    auto_lawd = st.checkbox("법정동코드 자동 추적(지도 클릭)", value=True)
 
 st.session_state.setdefault("lat", DEFAULT_CENTER[0])
 st.session_state.setdefault("lon", DEFAULT_CENTER[1])
 st.session_state.setdefault("lawd10", "")
+st.session_state.setdefault("region_name", "")
 
 m = folium.Map(location=[st.session_state.lat, st.session_state.lon], zoom_start=13)
 folium.Marker([st.session_state.lat, st.session_state.lon], tooltip="대상지").add_to(m)
 out = st_folium(m, height=420, use_container_width=True)
 
 if isinstance(out, dict) and out.get("last_clicked"):
-    st.session_state.lat = out["last_clicked"]["lat"]
-    st.session_state.lon = out["last_clicked"]["lng"]
+    new_lat = out["last_clicked"]["lat"]
+    new_lon = out["last_clicked"]["lng"]
+    changed = (new_lat != st.session_state.lat) or (new_lon != st.session_state.lon)
+    st.session_state.lat = new_lat
+    st.session_state.lon = new_lon
+
+    # 좌표 -> (법정동코드/지역명) 자동 추적
+    region = _kakao_coord2region(st.session_state.lat, st.session_state.lon, KAKAO_REST_API_KEY)
+    if region:
+        st.session_state.region_name = region.get("name") or st.session_state.region_name
+        if auto_lawd and region.get("code10"):
+            st.session_state.lawd10 = str(region["code10"])
+
+    # 클릭 즉시 마커/표시 갱신
+    if changed:
+        st.rerun()
 
 st.write("핀 좌표:", st.session_state.lat, st.session_state.lon)
+if st.session_state.get("region_name"):
+    st.write("선택 지역:", st.session_state.region_name)
 
 st.subheader("법정동코드(10자리)")
 st.session_state.lawd10 = st.text_input("법정동코드 입력", value=st.session_state.lawd10)
+st.caption("지역명 표시: 지도를 클릭하면 자동으로 표시됩니다.")
 
 
 def fetch_rtms(url, lawd5, ym):
